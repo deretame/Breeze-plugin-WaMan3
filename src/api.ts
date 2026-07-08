@@ -1,6 +1,6 @@
 import axios from "axios";
+import { cache, pluginConfig } from "breeze-plugin-kit";
 import { apiDecrypt, generateHeaders } from "./crypto";
-import { cache, pluginConfig } from "./tools";
 
 const DEFAULT_BASE_URL = "http://mseeowpm.pro";
 const BASE_URL_CACHE_KEY = "manwa3_base_url";

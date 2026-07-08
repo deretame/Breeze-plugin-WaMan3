@@ -38,7 +38,7 @@ import type {
   ToggleLikePayload,
   ToggleLikeResult,
   UserInfoBundleContract,
-} from "../types/type";
+} from "breeze-plugin-kit";
 import { getResponseData, init, manwaApi } from "./api";
 import {
   NOT_FOUND_IMAGE_URL,
