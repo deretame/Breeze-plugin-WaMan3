@@ -12,8 +12,9 @@ export function buildPluginInfo(): InfoContract {
     },
     describe: "蛙漫插件",
     version: "0.0.1",
-    home: "",
-    updateUrl: "",
+    home: "https://github.com/deretame/Breeze-plugin-WaMan3",
+    updateUrl:
+      "https://api.github.com/repos/deretame/Breeze-plugin-WaMan3/releases/latest",
     npmName: "breeze-plugin-waman3",
     function: [],
   };
