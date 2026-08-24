@@ -39,7 +39,25 @@ import type {
   ToggleLikeResult,
   UserInfoBundleContract,
 } from "breeze-plugin-kit";
-import { getResponseData, init, manwaApi } from "./api";
+import { flutterTools } from "breeze-plugin-kit";
+import {
+  AUTH_ACCOUNT_CONFIG_KEY,
+  AUTH_PASSWORD_CONFIG_KEY,
+  CONTENT_MODE_CONFIG_KEY,
+  ContentMode,
+  clearAuthState,
+  contentModeToGender,
+  getAuthState,
+  getResponseData,
+  init as initApi,
+  loadAuthCredentials,
+  loadContentMode,
+  loginWithoutCaptcha,
+  logout as logoutFromApi,
+  manwaApi,
+  saveAuthCredentials,
+  saveContentMode,
+} from "./api";
 import {
   NOT_FOUND_IMAGE_URL,
   PLUGIN_ID,
@@ -74,6 +92,51 @@ type ManwaSearchData = {
   nums: number;
   size: number;
   ads?: unknown;
+};
+
+type ManwaFeedData = {
+  list?: ManwaSearchItem[];
+  nums?: number;
+  size?: number;
+  ads?: unknown;
+};
+
+type ManwaCategoryData = ManwaFeedData & {
+  current_page_tags?: Array<{ tag?: string; isBlacklisted?: boolean }>;
+};
+
+// breeze-plugin-kit 旧版本尚未导出收藏工作流类型；这里按
+// plugin-dev-docs 中的 1.0 契约声明本插件实际使用的最小类型。
+type FavoriteWorkflowAction = "add" | "removeAll" | "removeFromTarget" | "move";
+
+type FavoriteWorkflowStartPayload = {
+  comicId?: string;
+  action?: FavoriteWorkflowAction;
+  currentFavorite?: boolean;
+  context?: { target?: { id?: string; name?: string } };
+  extern?: StringMap;
+};
+
+type FavoriteWorkflowContinuePayload = {
+  comicId?: string;
+  action?: FavoriteWorkflowAction;
+  continuationToken?: string;
+  input?: {
+    cancelled?: boolean;
+    key?: string;
+    value?: unknown;
+    created?: string;
+    values?: Record<string, unknown>;
+  };
+  extern?: StringMap;
+};
+
+type FavoriteWorkflowResult = {
+  status: "completed" | "awaitingInput" | "partial" | "failed" | "cancelled";
+  favorited?: boolean;
+  committed?: boolean;
+  message?: string;
+  errorCode?: string;
 };
 
 type ManwaTag = { name: string };
@@ -233,9 +296,120 @@ function buildChapterPages(
 
 const PAGE_SIZE = 20;
 
+const CONTENT_MODE_OPTIONS: Array<{ label: string; value: ContentMode }> = [
+  { label: "全部", value: "all" },
+  { label: "BL", value: "bl" },
+  { label: "禁漫 / 成人", value: "adult" },
+  { label: "一般", value: "normal" },
+  { label: "TL", value: "tl" },
+  { label: "GL", value: "gl" },
+];
+
+function readNumber(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readApiPage(payload: { page?: unknown; extern?: StringMap }): number {
+  const extern = toStringMap(payload.extern);
+  const requested = readNumber(payload.page ?? extern.page, 1);
+  // Breeze pages are one-based; Manwa3 list APIs are zero-based.
+  return Math.max(0, Math.trunc(requested) - 1);
+}
+
+async function readGender(
+  payload: { extern?: StringMap },
+  fallback: -2 | -1 = -1,
+): Promise<number> {
+  const extern = toStringMap(payload.extern);
+  const explicit = extern.gender ?? extern.c_gender;
+  if (explicit !== undefined && explicit !== null && String(explicit).trim()) {
+    return Math.trunc(readNumber(explicit, fallback));
+  }
+  return contentModeToGender(await loadContentMode(), fallback);
+}
+
+function buildPagedList(
+  payload: { extern?: StringMap },
+  type: string,
+  rawItems: unknown,
+  pageSize: number,
+): ComicPagedListContract {
+  const items = Array.isArray(rawItems)
+    ? rawItems
+        .filter((item): item is ManwaSearchItem => Boolean(item))
+        .map(buildSearchItem)
+    : [];
+  return {
+    source: PLUGIN_ID,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0" as const,
+      type,
+      card: "comicGrid",
+    },
+    data: {
+      items,
+      hasReachedMax: items.length < pageSize,
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // getInfo — 插件注册信息
 // ---------------------------------------------------------------------------
+
+type LoginToastLevel = "info" | "success" | "error";
+
+async function showLoginToast(
+  message: string,
+  level: LoginToastLevel,
+): Promise<void> {
+  try {
+    await flutterTools.showToast({
+      title: "蛙漫3登录",
+      message,
+      level,
+      seconds: level === "info" ? 2 : 4,
+    });
+  } catch {
+    // Toast 失败不能影响登录结果或公开内容浏览。
+  }
+}
+
+function getLoginErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.trim() || "未知错误";
+}
+
+async function loginWithToast(
+  account: string,
+  password: string,
+): Promise<{ uid?: string | number; ssid?: string }> {
+  await showLoginToast("正在登录，请稍候…", "info");
+  try {
+    const result = await loginWithoutCaptcha({ account, password });
+    await showLoginToast("登录成功，已保存登录状态", "success");
+    return result;
+  } catch (error) {
+    await showLoginToast(`登录失败：${getLoginErrorMessage(error)}`, "error");
+    throw error;
+  }
+}
+
+async function init(): Promise<void> {
+  await initApi();
+  const { account, password } = await loadAuthCredentials();
+  if (!account || !password.trim()) return;
+
+  // 初始化时自动登录一次。登录失败不应阻断未登录用户浏览公开内容；
+  // 收藏等登录接口会继续返回明确的业务错误。
+  try {
+    await loginWithToast(account, password);
+  } catch {
+    // 登录结果已经通过 Toast 告知用户。
+  }
+}
 
 async function getInfo(): Promise<InfoContract> {
   return buildPluginInfo() as InfoContract;
@@ -356,11 +530,13 @@ async function getComicDetail(
     totalViews: Number(raw.hits ?? 0),
     totalLikes: Number(raw.shits ?? 0),
     totalComments: 0,
+    // 详情接口没有返回当前账号的明确收藏布尔值；宿主在调用收藏入口时会
+    // 传入 currentFavorite，收藏操作本身再返回真实的下一状态。
     isFavourite: false,
     isLiked: false,
     allowComments: false,
     allowLike: false,
-    allowCollected: false,
+    allowCollected: true,
     allowDownload: true,
     extern: {},
   };
@@ -531,11 +707,127 @@ async function toggleLike(
 // toggleFavorite — 收藏
 // ---------------------------------------------------------------------------
 
+async function updateFavorite(
+  comicId: string,
+  favorited: boolean,
+  extern: StringMap = {},
+): Promise<void> {
+  const folderId = String(extern.folderId ?? "").trim();
+  const body: Record<string, unknown> = {
+    val: favorited ? 0 : 1,
+    book_id: comicId,
+  };
+  if (favorited && folderId) {
+    body.folder_id = folderId;
+  }
+
+  getResponseData(await manwaApi.post("/api/detail/favorite", body));
+}
+
+function favoriteWorkflowFailure(
+  payload: FavoriteWorkflowStartPayload | FavoriteWorkflowContinuePayload,
+  message: string,
+  errorCode: string,
+): FavoriteWorkflowResult {
+  const currentFavorite =
+    "currentFavorite" in payload && typeof payload.currentFavorite === "boolean"
+      ? payload.currentFavorite
+      : undefined;
+  return {
+    status: "failed",
+    favorited: currentFavorite,
+    committed: false,
+    message,
+    errorCode,
+  };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 新版收藏工作流：WaMan3 已确认支持全局收藏和全局取消收藏，
+ * 所以 add/removeAll 可以直接完成，不需要返回 continuationToken。
+ */
+async function startFavoriteAction(
+  payload: FavoriteWorkflowStartPayload = {},
+): Promise<FavoriteWorkflowResult> {
+  const comicId = String(payload.comicId ?? "").trim();
+  const action = payload.action;
+  if (!comicId) {
+    return favoriteWorkflowFailure(
+      payload,
+      "comicId 不能为空",
+      "INVALID_COMIC_ID",
+    );
+  }
+  if (!action) {
+    return favoriteWorkflowFailure(payload, "缺少收藏动作", "INVALID_ACTION");
+  }
+  if (action !== "add" && action !== "removeAll") {
+    return favoriteWorkflowFailure(
+      payload,
+      "当前图源只支持全局收藏和全局取消收藏",
+      "UNSUPPORTED_ACTION",
+    );
+  }
+
+  const favorited = action === "add";
+  try {
+    await updateFavorite(comicId, favorited, toStringMap(payload.extern));
+    return { status: "completed", favorited, committed: true };
+  } catch (error) {
+    return favoriteWorkflowFailure(
+      payload,
+      `收藏请求失败：${errorMessage(error)}`,
+      "FAVORITE_REQUEST_FAILED",
+    );
+  }
+}
+
+/**
+ * WaMan3 不会产生需要用户输入的继续令牌；保留该 fnPath 是为了完整
+ * 实现新版契约，并对外部误传的 continuationToken 给出失败结果。
+ */
+async function continueFavoriteAction(
+  payload: FavoriteWorkflowContinuePayload = {},
+): Promise<FavoriteWorkflowResult> {
+  void payload.input;
+  void payload.extern;
+  if (!String(payload.comicId ?? "").trim()) {
+    return favoriteWorkflowFailure(
+      payload,
+      "comicId 不能为空",
+      "INVALID_COMIC_ID",
+    );
+  }
+  if (!payload.action) {
+    return favoriteWorkflowFailure(payload, "缺少收藏动作", "INVALID_ACTION");
+  }
+  if (!String(payload.continuationToken ?? "").trim()) {
+    return favoriteWorkflowFailure(
+      payload,
+      "收藏工作流令牌无效或已过期",
+      "INVALID_CONTINUATION_TOKEN",
+    );
+  }
+  return favoriteWorkflowFailure(
+    payload,
+    "当前收藏操作不需要继续交互",
+    "UNSUPPORTED_CONTINUATION",
+  );
+}
+
 async function toggleFavorite(
   payload: ToggleFavoritePayload = {},
 ): Promise<ToggleFavoriteResult> {
-  void payload;
-  return { favorited: false, nextStep: "none" };
+  const comicId = String(payload.comicId ?? "").trim();
+  if (!comicId) throw new Error("comicId 不能为空");
+
+  const favorited = payload.currentFavorite !== true;
+  await updateFavorite(comicId, favorited, toStringMap(payload.extern));
+  return { favorited, nextStep: "none" };
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +846,9 @@ async function moveFavoriteToFolder(
   payload: MoveFavoriteToFolderPayload = {},
 ): Promise<{ ok: boolean }> {
   void payload;
-  return { ok: true };
+  // The recovered Manwa3 API exposes global add/remove only. Returning false
+  // is safer than claiming a folder move that was never sent to the server.
+  return { ok: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -625,23 +919,66 @@ async function getComicListSceneBundle(): Promise<ComicListSceneBundleContract> 
 async function getRankingData(
   _payload: SearchComicPayload = {},
 ): Promise<ComicPagedListContract> {
-  const searchResult = await searchComic({
-    keyword: "1",
-    page: _payload.page,
-    extern: _payload.extern,
+  const extern = toStringMap(_payload.extern);
+  const rankTypeValue = extern.rankType ?? extern.type;
+  const rankType =
+    rankTypeValue === "week"
+      ? 1
+      : rankTypeValue === "month"
+        ? 2
+        : Math.trunc(readNumber(rankTypeValue, 0));
+  const response = await manwaApi.get("/api/rank/index", {
+    params: {
+      c_gender: await readGender(_payload),
+      type: rankType,
+      page: readApiPage(_payload),
+    },
   });
-  return {
-    source: PLUGIN_ID,
-    extern: _payload.extern ?? null,
-    scheme: {
-      version: "1.0.0" as const,
-      type: "rankingFeed" as const,
+  const data = getResponseData<ManwaFeedData>(response);
+  return buildPagedList(_payload, "rankingFeed", data.list, 50);
+}
+
+// ---------------------------------------------------------------------------
+// getNewestData — 更新列表
+// ---------------------------------------------------------------------------
+
+async function getNewestData(
+  payload: SearchComicPayload = {},
+): Promise<ComicPagedListContract> {
+  const response = await manwaApi.get("/api/newest/index", {
+    params: {
+      page: readApiPage(payload),
+      c_gender: await readGender(payload),
     },
-    data: {
-      hasReachedMax: searchResult.paging.hasReachedMax,
-      items: searchResult.items,
+  });
+  const data = getResponseData<ManwaSearchItem[] | ManwaFeedData>(response);
+  const items = Array.isArray(data) ? data : data.list;
+  return buildPagedList(payload, "newestFeed", items, 12);
+}
+
+// ---------------------------------------------------------------------------
+// getCategoryData — 分类列表
+// ---------------------------------------------------------------------------
+
+async function getCategoryData(
+  payload: SearchComicPayload = {},
+): Promise<ComicPagedListContract> {
+  const extern = toStringMap(payload.extern);
+  const response = await manwaApi.get("/api/classes/index", {
+    params: {
+      gender: await readGender(payload, -2),
+      tag: String(extern.tag ?? ""),
+      area: Math.trunc(readNumber(extern.area, 0)),
+      end: Math.trunc(readNumber(extern.end, 0)),
+      has_full: Math.trunc(readNumber(extern.has_full, 0)),
+      level: Math.trunc(readNumber(extern.level, 0)),
+      st: Math.trunc(readNumber(extern.st, 0)),
+      page: readApiPage(payload),
+      orderBy: Math.trunc(readNumber(extern.orderBy, 0)),
     },
-  };
+  });
+  const data = getResponseData<ManwaCategoryData>(response);
+  return buildPagedList(payload, "categoryFeed", data.list, 12);
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +1016,99 @@ async function getRankingFilterBundle(): Promise<FilterBundleContract> {
       ],
     },
     data: { values: { rankType: "day" } },
+  };
+}
+
+async function getCategoryFilterBundle(
+  payload: SearchComicPayload = {},
+): Promise<FilterBundleContract> {
+  const response = await manwaApi.get("/api/classes/index", {
+    params: {
+      gender: await readGender(payload, -2),
+      tag: "",
+      area: 0,
+      end: 0,
+      has_full: 0,
+      level: 0,
+      st: 0,
+      page: 0,
+      orderBy: 0,
+    },
+  });
+  const data = getResponseData<ManwaCategoryData>(response);
+  const extern = toStringMap(payload.extern);
+  const tags = (data.current_page_tags ?? [])
+    .filter((item) => item.isBlacklisted !== true && String(item.tag ?? ""))
+    .map((item) => String(item.tag));
+
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "filter" as const,
+      title: "分类标签",
+      fields: [
+        {
+          key: "tag",
+          kind: "choice" as const,
+          label: "标签",
+          options: [
+            { label: "全部", value: "", result: { extern: { tag: "" } } },
+            ...tags.map((tag) => ({
+              label: tag,
+              value: tag,
+              result: { extern: { tag } },
+            })),
+          ],
+        },
+      ],
+    },
+    data: { values: { tag: String(extern.tag ?? "") } },
+  };
+}
+
+async function getNewestSceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "comicListSceneBundle" as const,
+    },
+    data: {
+      scene: {
+        title: "更新",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: { fnPath: "getNewestData", core: {}, extern: {} },
+        },
+      },
+    },
+  };
+}
+
+async function getCategorySceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "comicListSceneBundle" as const,
+    },
+    data: {
+      scene: {
+        title: "分类",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: { fnPath: "getCategoryData", core: {}, extern: {} },
+        },
+        filter: {
+          fnPath: "getCategoryFilterBundle",
+          core: {},
+          extern: {},
+        },
+      },
+    },
   };
 }
 
@@ -779,16 +1209,56 @@ async function postCommentReply(
 // ---------------------------------------------------------------------------
 
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
+  const [{ account, password }, contentMode] = await Promise.all([
+    loadAuthCredentials(),
+    loadContentMode(),
+  ]);
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0" as const,
       type: "settings" as const,
-      sections: [],
+      sections: [
+        {
+          id: "account",
+          title: "账号",
+          fields: [
+            {
+              key: AUTH_ACCOUNT_CONFIG_KEY,
+              kind: "text" as const,
+              label: "账号",
+              fnPath: "onAuthChanged",
+            },
+            {
+              key: AUTH_PASSWORD_CONFIG_KEY,
+              kind: "password" as const,
+              label: "密码",
+              fnPath: "onAuthChanged",
+            },
+          ],
+        },
+        {
+          id: "content",
+          title: "内容",
+          fields: [
+            {
+              key: CONTENT_MODE_CONFIG_KEY,
+              kind: "choice" as const,
+              label: "内容模式",
+              options: CONTENT_MODE_OPTIONS,
+              fnPath: "onContentModeChanged",
+            },
+          ],
+        },
+      ],
     },
     data: {
-      canShowUserInfo: false,
-      values: {},
+      canShowUserInfo: true,
+      values: {
+        [AUTH_ACCOUNT_CONFIG_KEY]: account,
+        [AUTH_PASSWORD_CONFIG_KEY]: password,
+        [CONTENT_MODE_CONFIG_KEY]: contentMode,
+      },
     },
   };
 }
@@ -804,6 +1274,7 @@ async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContract> {
       version: "1.0.0" as const,
       type: "capabilities" as const,
       actions: [
+        { key: "logout", title: "退出登录", fnPath: "logoutAccount" },
         { key: "clear", title: "清理插件缓存", fnPath: "clearPluginCache" },
       ],
     },
@@ -816,6 +1287,10 @@ async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContract> {
 // ---------------------------------------------------------------------------
 
 async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
+  const auth = await getAuthState();
+  const lines = auth.loggedIn
+    ? [auth.account, auth.uid ? `用户 ID：${auth.uid}` : "已登录"]
+    : ["未登录"];
   return {
     source: PLUGIN_ID,
     scheme: { version: "1.0.0" as const, type: "userInfo" as const },
@@ -828,7 +1303,7 @@ async function getUserInfoBundle(): Promise<UserInfoBundleContract> {
         path: "u/1.jpg",
         extern: {},
       }),
-      lines: ["未登录"],
+      lines,
     },
   };
 }
@@ -850,8 +1325,64 @@ async function getFunctionPage(
 async function onAuthChanged(
   payload: { key?: string; value?: unknown; allValues?: StringMap } = {},
 ): Promise<Record<string, unknown>> {
-  void payload;
-  return {};
+  const current = await loadAuthCredentials();
+  const values = toStringMap(payload.allValues);
+  let account = current.account;
+  let password = current.password;
+
+  if (AUTH_ACCOUNT_CONFIG_KEY in values) {
+    account = String(values[AUTH_ACCOUNT_CONFIG_KEY] ?? "").trim();
+  }
+  if (AUTH_PASSWORD_CONFIG_KEY in values) {
+    password = String(values[AUTH_PASSWORD_CONFIG_KEY] ?? "");
+  }
+  if (payload.key === AUTH_ACCOUNT_CONFIG_KEY) {
+    account = String(payload.value ?? "").trim();
+  }
+  if (payload.key === AUTH_PASSWORD_CONFIG_KEY) {
+    password = String(payload.value ?? "");
+  }
+
+  await saveAuthCredentials(account, password);
+  if (!account || !password.trim()) {
+    return { ok: true, loggedIn: false, message: "请填写账号和密码" };
+  }
+
+  try {
+    const result = await loginWithToast(account, password);
+    return {
+      ok: true,
+      loggedIn: true,
+      uid: result.uid === undefined ? "" : String(result.uid),
+    };
+  } catch (error) {
+    // 避免新账号登录失败时继续沿用旧账号的 Cookie。
+    await clearAuthState();
+    return {
+      ok: false,
+      loggedIn: false,
+      message: getLoginErrorMessage(error),
+    };
+  }
+}
+
+async function onContentModeChanged(
+  payload: { key?: string; value?: unknown; allValues?: StringMap } = {},
+): Promise<Record<string, unknown>> {
+  const values = toStringMap(payload.allValues);
+  const value =
+    payload.key === CONTENT_MODE_CONFIG_KEY
+      ? payload.value
+      : values[CONTENT_MODE_CONFIG_KEY];
+  const mode = await saveContentMode(value);
+  return {
+    ok: true,
+    [CONTENT_MODE_CONFIG_KEY]: mode,
+    message: `内容模式已切换为${
+      CONTENT_MODE_OPTIONS.find((option) => option.value === mode)?.label ??
+      mode
+    }`,
+  };
 }
 
 async function onQualityChanged(
@@ -863,6 +1394,11 @@ async function onQualityChanged(
 
 async function clearPluginCache(): Promise<Record<string, unknown>> {
   return { ok: true };
+}
+
+async function logoutAccount(): Promise<Record<string, unknown>> {
+  await logoutFromApi();
+  return { ok: true, loggedIn: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -883,6 +1419,8 @@ export default {
 
   // social
   toggleLike,
+  startFavoriteAction,
+  continueFavoriteAction,
   toggleFavorite,
   listFavoriteFolders,
   moveFavoriteToFolder,
@@ -896,6 +1434,11 @@ export default {
   getComicListSceneBundle,
   getRankingData,
   getRankingFilterBundle,
+  getNewestData,
+  getNewestSceneBundle,
+  getCategoryData,
+  getCategoryFilterBundle,
+  getCategorySceneBundle,
 
   // settings
   getSettingsBundle,
@@ -904,7 +1447,9 @@ export default {
 
   // fnPath callbacks
   onAuthChanged,
+  onContentModeChanged,
   onQualityChanged,
+  logoutAccount,
   clearPluginCache,
 
   // function pages
