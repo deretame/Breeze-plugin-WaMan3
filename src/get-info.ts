@@ -11,7 +11,7 @@ export function buildPluginInfo(): InfoContract {
       describe: "",
     },
     describe: "蛙漫插件",
-    version: "0.0.2",
+    version: "0.0.3",
     home: "https://github.com/deretame/Breeze-plugin-WaMan3",
     updateUrl:
       "https://api.github.com/repos/deretame/Breeze-plugin-WaMan3/releases/latest",
@@ -85,6 +85,32 @@ export function buildPluginInfo(): InfoContract {
                 fnPath: "getCategoryFilterBundle",
                 core: {},
                 extern: { source: "categories" },
+              },
+            },
+          },
+        },
+      },
+      {
+        id: "cloudFavorite",
+        title: "云端收藏",
+        action: {
+          type: "openComicList",
+          payload: {
+            scene: {
+              title: "云端收藏",
+              source: PLUGIN_ID,
+              body: {
+                type: "pluginPagedComicList",
+                request: {
+                  fnPath: "getCloudFavoriteData",
+                  core: {},
+                  extern: { source: "cloudFavorite" },
+                },
+              },
+              filter: {
+                fnPath: "getCloudFavoriteFilterBundle",
+                core: {},
+                extern: { source: "cloudFavorite" },
               },
             },
           },

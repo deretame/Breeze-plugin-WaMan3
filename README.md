@@ -27,6 +27,9 @@
 - `toggleFavorite` — 收藏
 - `listFavoriteFolders` — 收藏夹列表
 - `moveFavoriteToFolder` — 移动到收藏夹
+- `getCloudFavoriteData` — 查看云端收藏
+- `getCloudFavoriteFilterBundle` — 云端收藏夹筛选
+- `getCloudFavoriteSceneBundle` — 云端收藏场景
 - `getCommentFeed` — 评论列表
 - `loadCommentReplies` — 加载回复
 - `postComment` — 发评论
@@ -80,7 +83,21 @@ Content-Type: application/json
 POST /api/detail/favorite
 ```
 
-收藏使用 `{ "val": 0, "book_id": "<漫画ID>" }`，取消使用 `{ "val": 1, "book_id": "<漫画ID>" }`；调用方已知收藏夹 ID 时，收藏请求也会透传 `folder_id`。收藏夹列表、移动和按目标收藏夹移除尚未接入，因为当前已确认的 API 只稳定支持全局收藏/取消收藏。
+收藏使用 `{ "val": 0, "book_id": "<漫画ID>" }`，取消使用 `{ "val": 1, "book_id": "<漫画ID>" }`；调用方已知收藏夹 ID 时，收藏请求也会透传 `folder_id`。
+
+云端收藏列表使用：
+
+```http
+GET /api/users/favorite?page=<从0开始的页码>&folder_id=<可选收藏夹ID>
+```
+
+收藏夹筛选使用：
+
+```http
+GET /api/users/folder_list
+```
+
+云端收藏入口需要先在插件设置中登录；列表中的漫画会复用详情页和阅读页的 `book_id`。
 
 ## 快速开始
 

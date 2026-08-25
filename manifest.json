@@ -7,7 +7,7 @@
     "describe": ""
   },
   "describe": "蛙漫插件",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "home": "https://github.com/deretame/Breeze-plugin-WaMan3",
   "updateUrl": "https://api.github.com/repos/deretame/Breeze-plugin-WaMan3/releases/latest",
   "npmName": "breeze-plugin-waman3",
@@ -89,6 +89,36 @@
               "core": {},
               "extern": {
                 "source": "categories"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "cloudFavorite",
+      "title": "云端收藏",
+      "action": {
+        "type": "openComicList",
+        "payload": {
+          "scene": {
+            "title": "云端收藏",
+            "source": "4471434f-c73a-4dd3-b414-a6a53777d8e0",
+            "body": {
+              "type": "pluginPagedComicList",
+              "request": {
+                "fnPath": "getCloudFavoriteData",
+                "core": {},
+                "extern": {
+                  "source": "cloudFavorite"
+                }
+              }
+            },
+            "filter": {
+              "fnPath": "getCloudFavoriteFilterBundle",
+              "core": {},
+              "extern": {
+                "source": "cloudFavorite"
               }
             }
           }

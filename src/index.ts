@@ -105,6 +105,39 @@ type ManwaCategoryData = ManwaFeedData & {
   current_page_tags?: Array<{ tag?: string; isBlacklisted?: boolean }>;
 };
 
+type ManwaFavoriteItem = {
+  id?: string | number;
+  book_id?: string | number;
+  book_name?: string;
+  book_img?: string;
+  chapter_name?: string;
+  end?: string | number;
+  last_time?: string;
+  read_last?: string;
+  lv?: string | number;
+  favorite_count?: string | number;
+  [key: string]: unknown;
+};
+
+type ManwaFavoriteData = {
+  list?: ManwaFavoriteItem[];
+  limit?: number;
+  favorite_limit_info?: Record<string, unknown>;
+};
+
+type ManwaFavoriteFolder = {
+  id?: string | number;
+  folder_id?: string | number;
+  name?: string;
+  folder_name?: string;
+};
+
+type CloudFavoritePayload = {
+  page?: unknown;
+  folderId?: unknown;
+  extern?: StringMap;
+};
+
 // breeze-plugin-kit 旧版本尚未导出收藏工作流类型；这里按
 // plugin-dev-docs 中的 1.0 契约声明本插件实际使用的最小类型。
 type FavoriteWorkflowAction = "add" | "removeAll" | "removeFromTarget" | "move";
@@ -255,6 +288,36 @@ function buildSearchItem(raw: ManwaSearchItem) {
     ],
     raw: raw as unknown as StringMap,
     extern: {},
+  };
+}
+
+function buildFavoriteItem(raw: ManwaFavoriteItem) {
+  const id = String(raw.book_id ?? raw.id ?? "").trim();
+  if (!id) return null;
+
+  const title = String(raw.book_name ?? "").trim() || `漫画 ${id}`;
+  const chapterName = String(raw.chapter_name ?? "").trim();
+  const status = String(raw.end ?? "").trim();
+  const coverUrl = String(raw.book_img ?? "").trim();
+
+  return {
+    source: PLUGIN_ID,
+    id,
+    title,
+    subtitle: chapterName || status,
+    finished: status === "1" || /完结/.test(status),
+    likesCount: Number(raw.favorite_count ?? 0),
+    viewsCount: 0,
+    updatedAt: String(raw.last_time ?? "").trim(),
+    cover: buildCoverImage(id, coverUrl),
+    metadata: [
+      createBasicMetadata("status", "状态", status ? [status] : []),
+      createBasicMetadata("chapter", "章节", chapterName ? [chapterName] : []),
+    ],
+    raw: raw as unknown as StringMap,
+    extern: {
+      favoriteEntryId: String(raw.id ?? "").trim(),
+    },
   };
 }
 
@@ -830,12 +893,162 @@ async function toggleFavorite(
   return { favorited, nextStep: "none" };
 }
 
-// ---------------------------------------------------------------------------
-// listFavoriteFolders — 收藏夹列表
-// ---------------------------------------------------------------------------
+async function ensureFavoriteLogin(): Promise<void> {
+  if (!(await getAuthState()).loggedIn) {
+    throw new Error("请先在插件设置中登录账号");
+  }
+}
+
+function normalizeFavoriteFolders(data: unknown): Array<{ id: string; name: string }> {
+  const list = Array.isArray(data)
+    ? data
+    : data &&
+        typeof data === "object" &&
+        Array.isArray((data as ManwaFavoriteData).list)
+      ? (data as ManwaFavoriteData).list ?? []
+      : data &&
+          typeof data === "object" &&
+          Array.isArray((data as { items?: unknown[] }).items)
+        ? (data as { items: unknown[] }).items
+        : [];
+
+  return list
+    .map((item): { id: string; name: string } | null => {
+      if (!item || typeof item !== "object") return null;
+      const folder = item as ManwaFavoriteFolder;
+      const id = String(folder.id ?? folder.folder_id ?? "").trim();
+      if (!id) return null;
+      return {
+        id,
+        name: String(folder.name ?? folder.folder_name ?? "").trim() || id,
+      };
+    })
+    .filter((item): item is { id: string; name: string } => item !== null);
+}
+
+async function fetchFavoriteFolders(): Promise<Array<{ id: string; name: string }>> {
+  await ensureFavoriteLogin();
+  const response = await manwaApi.get("/api/users/folder_list");
+  return normalizeFavoriteFolders(getResponseData<unknown>(response));
+}
 
 async function listFavoriteFolders(): Promise<ListFavoriteFoldersResult> {
-  return { items: [] };
+  return { items: await fetchFavoriteFolders() };
+}
+
+async function getCloudFavoriteData(
+  payload: CloudFavoritePayload = {},
+): Promise<ComicPagedListContract> {
+  await ensureFavoriteLogin();
+
+  const extern = toStringMap(payload.extern);
+  const params: Record<string, unknown> = {
+    // WaMan3 uses zero-based pages while Breeze uses one-based pages.
+    page: readApiPage(payload),
+  };
+  const folderId = String(payload.folderId ?? extern.folderId ?? "").trim();
+  if (folderId && folderId !== "0" && folderId !== "all") {
+    params.folder_id = folderId;
+  }
+  const gender = extern.gender ?? extern.c_gender;
+  if (gender !== undefined && String(gender).trim()) {
+    params.gender = Math.trunc(readNumber(gender, -1));
+  }
+
+  const response = await manwaApi.get("/api/users/favorite", { params });
+  const data = getResponseData<ManwaFavoriteData>(response);
+  const rawItems = Array.isArray(data?.list) ? data.list : [];
+  const items = rawItems
+    .map(buildFavoriteItem)
+    .filter(
+      (item): item is NonNullable<ReturnType<typeof buildFavoriteItem>> =>
+        item !== null,
+    );
+  const pageSize = Math.max(1, Math.trunc(readNumber(data?.limit, 15)));
+
+  return {
+    source: PLUGIN_ID,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "cloudFavoriteFeed",
+      card: "comicGrid",
+    },
+    data: {
+      items,
+      hasReachedMax: items.length === 0 || items.length < pageSize,
+    },
+  };
+}
+
+async function getCloudFavoriteFilterBundle(
+  payload: CloudFavoritePayload = {},
+): Promise<FilterBundleContract> {
+  const extern = toStringMap(payload.extern);
+  const selectedFolderId = String(
+    payload.folderId ?? extern.folderId ?? "",
+  ).trim();
+  const folders = await fetchFavoriteFolders();
+
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "filter" as const,
+      title: "云端收藏筛选",
+      fields: [
+        {
+          key: "folderId",
+          kind: "choice" as const,
+          label: "收藏夹",
+          options: [
+            {
+              label: "全部",
+              value: "",
+              result: { extern: { folderId: "" } },
+            },
+            ...folders.map((folder) => ({
+              label: folder.name,
+              value: folder.id,
+              result: { extern: { folderId: folder.id } },
+            })),
+          ],
+        },
+      ],
+    },
+    data: {
+      values: { folderId: selectedFolderId },
+    },
+  };
+}
+
+async function getCloudFavoriteSceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0" as const,
+      type: "comicListSceneBundle" as const,
+    },
+    data: {
+      scene: {
+        title: "云端收藏",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: {
+            fnPath: "getCloudFavoriteData",
+            core: {},
+            extern: { source: "cloudFavorite" },
+          },
+        },
+        filter: {
+          fnPath: "getCloudFavoriteFilterBundle",
+          core: {},
+          extern: { source: "cloudFavorite" },
+        },
+      },
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,6 +1652,9 @@ export default {
   getCategoryData,
   getCategoryFilterBundle,
   getCategorySceneBundle,
+  getCloudFavoriteData,
+  getCloudFavoriteFilterBundle,
+  getCloudFavoriteSceneBundle,
 
   // settings
   getSettingsBundle,
