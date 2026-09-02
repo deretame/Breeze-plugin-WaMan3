@@ -468,7 +468,7 @@ async function init(): Promise<void> {
   // 初始化时自动登录一次。登录失败不应阻断未登录用户浏览公开内容；
   // 收藏等登录接口会继续返回明确的业务错误。
   try {
-    await loginWithToast(account, password);
+    await loginWithoutCaptcha({ account, password });
   } catch {
     // 登录结果已经通过 Toast 告知用户。
   }
@@ -899,13 +899,15 @@ async function ensureFavoriteLogin(): Promise<void> {
   }
 }
 
-function normalizeFavoriteFolders(data: unknown): Array<{ id: string; name: string }> {
+function normalizeFavoriteFolders(
+  data: unknown,
+): Array<{ id: string; name: string }> {
   const list = Array.isArray(data)
     ? data
     : data &&
         typeof data === "object" &&
         Array.isArray((data as ManwaFavoriteData).list)
-      ? (data as ManwaFavoriteData).list ?? []
+      ? ((data as ManwaFavoriteData).list ?? [])
       : data &&
           typeof data === "object" &&
           Array.isArray((data as { items?: unknown[] }).items)
@@ -926,7 +928,9 @@ function normalizeFavoriteFolders(data: unknown): Array<{ id: string; name: stri
     .filter((item): item is { id: string; name: string } => item !== null);
 }
 
-async function fetchFavoriteFolders(): Promise<Array<{ id: string; name: string }>> {
+async function fetchFavoriteFolders(): Promise<
+  Array<{ id: string; name: string }>
+> {
   await ensureFavoriteLogin();
   const response = await manwaApi.get("/api/users/folder_list");
   return normalizeFavoriteFolders(getResponseData<unknown>(response));
