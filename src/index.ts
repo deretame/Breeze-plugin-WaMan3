@@ -9,6 +9,7 @@ import type {
   ComicDetailContract,
   ComicDetailNormal,
   ComicDetailPayload,
+  ComicListItem,
   ComicListSceneBundleContract,
   ComicPagedListContract,
   CommentFeedContract,
@@ -45,6 +46,8 @@ import {
   AUTH_PASSWORD_CONFIG_KEY,
   CONTENT_MODE_CONFIG_KEY,
   ContentMode,
+  apiGet,
+  apiPost,
   clearAuthState,
   contentModeToGender,
   getAuthState,
@@ -54,7 +57,6 @@ import {
   loadContentMode,
   loginWithoutCaptcha,
   logout as logoutFromApi,
-  manwaApi,
   saveAuthCredentials,
   saveContentMode,
 } from "./api";
@@ -67,6 +69,7 @@ import {
   createMetadataActionList,
   toStringMap,
 } from "./common";
+import "./polyfill";
 import { imageDecrypt } from "./crypto";
 import { buildPluginInfo } from "./get-info";
 
@@ -291,7 +294,7 @@ function buildSearchItem(raw: ManwaSearchItem) {
   };
 }
 
-function buildFavoriteItem(raw: ManwaFavoriteItem) {
+function buildFavoriteItem(raw: ManwaFavoriteItem): ComicListItem | null {
   const id = String(raw.book_id ?? raw.id ?? "").trim();
   if (!id) return null;
 
@@ -367,6 +370,20 @@ const CONTENT_MODE_OPTIONS: Array<{ label: string; value: ContentMode }> = [
   { label: "TL", value: "tl" },
   { label: "GL", value: "gl" },
 ];
+
+function abortSignalFallback(timeoutMs: number): AbortSignal | undefined {
+  const Controller = globalThis.AbortController;
+  if (typeof Controller !== "function") return undefined;
+  const controller = new Controller();
+  setTimeout(() => {
+    try {
+      controller.abort();
+    } catch {
+      // ignore
+    }
+  }, Math.max(0, Number(timeoutMs) || 0));
+  return controller.signal;
+}
 
 function readNumber(value: unknown, fallback: number): number {
   const parsed = Number(value);
@@ -490,18 +507,18 @@ async function searchComic(
   const keyword =
     String(payload.keyword ?? extern.keyword ?? "1").trim() || "1";
 
-  const response = await manwaApi.get("/api/search/index", {
-    params: { k: keyword, page },
+  const response = await apiGet<ManwaSearchData>("/api/search/index", {
+    k: keyword,
+    page: page - 1,
   });
-  console.log(response.data);
   const data = getResponseData<ManwaSearchData>(response);
-  const items = data.list.map(buildSearchItem);
+  const items = (data.list ?? []).map(buildSearchItem);
   const total = Number(data.nums ?? items.length);
   const paging = {
     page,
-    pages: page + 1,
+    pages: items.length > 0 ? Math.ceil(total / items.length) : page + 1,
     total,
-    hasReachedMax: false,
+    hasReachedMax: items.length === 0 || page * items.length >= total,
   };
 
   return {
@@ -529,8 +546,8 @@ async function getComicDetail(
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
 
-  const response = await manwaApi.get("/api/detail/index", {
-    params: { id: comicId },
+  const response = await apiGet<ManwaDetailData>("/api/detail/index", {
+    id: comicId,
   });
   const raw = getResponseData<ManwaDetailData>(response);
 
@@ -633,8 +650,9 @@ async function getChapter(
   const chapterId = String(payload.chapterId ?? "").trim();
   if (!chapterId) throw new Error("chapterId 不能为空");
 
-  const response = await manwaApi.get("/api/chapters/index", {
-    params: { id: chapterId, img_host: 0 },
+  const response = await apiGet<ManwaChapterData>("/api/chapters/index", {
+    id: chapterId,
+    img_host: 0,
   });
   const raw = getResponseData<ManwaChapterData>(response);
   const pages = buildChapterPages(comicId, chapterId, raw.piclist ?? []);
@@ -735,8 +753,12 @@ async function fetchImageBytes({
   const targetUrl = String(url).trim();
   if (!targetUrl) throw new Error("url 不能为空");
 
+  const timeout =
+    typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(timeoutMs)
+      : abortSignalFallback(timeoutMs);
   const res = await fetch(targetUrl, {
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: timeout,
     headers: {
       "x-rquickjs-host-offload-binary-v1": "1",
     },
@@ -783,8 +805,7 @@ async function updateFavorite(
   if (favorited && folderId) {
     body.folder_id = folderId;
   }
-
-  getResponseData(await manwaApi.post("/api/detail/favorite", body));
+  getResponseData(await apiPost("/api/detail/favorite", body));
 }
 
 function favoriteWorkflowFailure(
@@ -932,7 +953,7 @@ async function fetchFavoriteFolders(): Promise<
   Array<{ id: string; name: string }>
 > {
   await ensureFavoriteLogin();
-  const response = await manwaApi.get("/api/users/folder_list");
+  const response = await apiGet<unknown>("/api/users/folder_list");
   return normalizeFavoriteFolders(getResponseData<unknown>(response));
 }
 
@@ -959,15 +980,12 @@ async function getCloudFavoriteData(
     params.gender = Math.trunc(readNumber(gender, -1));
   }
 
-  const response = await manwaApi.get("/api/users/favorite", { params });
+  const response = await apiGet<ManwaFavoriteData>("/api/users/favorite", params);
   const data = getResponseData<ManwaFavoriteData>(response);
   const rawItems = Array.isArray(data?.list) ? data.list : [];
   const items = rawItems
     .map(buildFavoriteItem)
-    .filter(
-      (item): item is NonNullable<ReturnType<typeof buildFavoriteItem>> =>
-        item !== null,
-    );
+    .filter((item): item is ComicListItem => item !== null);
   const pageSize = Math.max(1, Math.trunc(readNumber(data?.limit, 15)));
 
   return {
@@ -1144,12 +1162,10 @@ async function getRankingData(
       : rankTypeValue === "month"
         ? 2
         : Math.trunc(readNumber(rankTypeValue, 0));
-  const response = await manwaApi.get("/api/rank/index", {
-    params: {
-      c_gender: await readGender(_payload),
-      type: rankType,
-      page: readApiPage(_payload),
-    },
+  const response = await apiGet<ManwaFeedData>("/api/rank/index", {
+    c_gender: await readGender(_payload),
+    type: rankType,
+    page: readApiPage(_payload),
   });
   const data = getResponseData<ManwaFeedData>(response);
   return buildPagedList(_payload, "rankingFeed", data.list, 50);
@@ -1162,12 +1178,13 @@ async function getRankingData(
 async function getNewestData(
   payload: SearchComicPayload = {},
 ): Promise<ComicPagedListContract> {
-  const response = await manwaApi.get("/api/newest/index", {
-    params: {
+  const response = await apiGet<ManwaSearchItem[] | ManwaFeedData>(
+    "/api/newest/index",
+    {
       page: readApiPage(payload),
       c_gender: await readGender(payload),
     },
-  });
+  );
   const data = getResponseData<ManwaSearchItem[] | ManwaFeedData>(response);
   const items = Array.isArray(data) ? data : data.list;
   return buildPagedList(payload, "newestFeed", items, 12);
@@ -1181,18 +1198,16 @@ async function getCategoryData(
   payload: SearchComicPayload = {},
 ): Promise<ComicPagedListContract> {
   const extern = toStringMap(payload.extern);
-  const response = await manwaApi.get("/api/classes/index", {
-    params: {
-      gender: await readGender(payload, -2),
-      tag: String(extern.tag ?? ""),
-      area: Math.trunc(readNumber(extern.area, 0)),
-      end: Math.trunc(readNumber(extern.end, 0)),
-      has_full: Math.trunc(readNumber(extern.has_full, 0)),
-      level: Math.trunc(readNumber(extern.level, 0)),
-      st: Math.trunc(readNumber(extern.st, 0)),
-      page: readApiPage(payload),
-      orderBy: Math.trunc(readNumber(extern.orderBy, 0)),
-    },
+  const response = await apiGet<ManwaCategoryData>("/api/classes/index", {
+    gender: await readGender(payload, -2),
+    tag: String(extern.tag ?? ""),
+    area: Math.trunc(readNumber(extern.area, 0)),
+    end: Math.trunc(readNumber(extern.end, 0)),
+    has_full: Math.trunc(readNumber(extern.has_full, 0)),
+    level: Math.trunc(readNumber(extern.level, 0)),
+    st: Math.trunc(readNumber(extern.st, 0)),
+    page: readApiPage(payload),
+    orderBy: Math.trunc(readNumber(extern.orderBy, 0)),
   });
   const data = getResponseData<ManwaCategoryData>(response);
   return buildPagedList(payload, "categoryFeed", data.list, 12);
@@ -1239,18 +1254,16 @@ async function getRankingFilterBundle(): Promise<FilterBundleContract> {
 async function getCategoryFilterBundle(
   payload: SearchComicPayload = {},
 ): Promise<FilterBundleContract> {
-  const response = await manwaApi.get("/api/classes/index", {
-    params: {
-      gender: await readGender(payload, -2),
-      tag: "",
-      area: 0,
-      end: 0,
-      has_full: 0,
-      level: 0,
-      st: 0,
-      page: 0,
-      orderBy: 0,
-    },
+  const response = await apiGet<ManwaCategoryData>("/api/classes/index", {
+    gender: await readGender(payload, -2),
+    tag: "",
+    area: 0,
+    end: 0,
+    has_full: 0,
+    level: 0,
+    st: 0,
+    page: 0,
+    orderBy: 0,
   });
   const data = getResponseData<ManwaCategoryData>(response);
   const extern = toStringMap(payload.extern);

@@ -1,4 +1,4 @@
-import axios from "axios";
+import axios, { type AxiosResponse } from "axios";
 import { cache, pluginConfig } from "breeze-plugin-kit";
 import { apiDecrypt, generateHeaders } from "./crypto";
 
@@ -10,10 +10,11 @@ const CANDIDATE_BASE_URLS = [
   "http://mseeowpm1.xyz",
   "http://mseeowpm2.cc",
   "https://mseeowpma.cc",
+  "https://manwa.me",
 ];
 
 const USER_AGENT =
-  "Mozilla/5.0 (Linux; Android 12; PGT-AN20) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 mwa-1.1.26+1 (Android/12 HONOR/PGT-AN20)";
+  "Mozilla/5.0 (Linux; Android 12; PGT-AN20) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36 mwa-1.1.27+1 (Android/12 HONOR/PGT-AN20)";
 
 export const AUTH_ACCOUNT_CONFIG_KEY = "auth.account";
 export const AUTH_PASSWORD_CONFIG_KEY = "auth.password";
@@ -174,23 +175,52 @@ export async function getAuthState(): Promise<AuthState> {
   };
 }
 
-function splitSetCookieHeader(value: string): string[] {
-  return value.split(/,(?=\s*[^;,=\s]+=[^;,]+)/g);
+const COOKIE_ATTRIBUTE_NAMES: Record<string, true> = {
+  expires: true,
+  "max-age": true,
+  path: true,
+  domain: true,
+  secure: true,
+  httponly: true,
+  samesite: true,
+};
+
+function isCookieAttributePair(pair: string): boolean {
+  const name = pair.split("=", 1)[0].trim().toLowerCase();
+  return name in COOKIE_ATTRIBUTE_NAMES;
 }
 
+/**
+ * 从一个或多个 Set-Cookie 值中提取 `name=value` 对。
+ * 数组元素各自独立（axios fetch adapter 的 getSetCookie() 即如此）；
+ * 字符串形式（多个 cookie 用逗号连接）里 Expires 日期也含逗号，
+ * 不能按逗号切——按“非属性名的新 pair 即新 cookie”切分。
+ */
 function cookiePairs(value: unknown): string[] {
   const values = Array.isArray(value) ? value : [value];
-  return values
-    .flatMap((item) =>
-      typeof item === "string" ? splitSetCookieHeader(item) : [],
-    )
-    .map((item) => item.split(";", 1)[0].trim())
-    .filter((item) => /^[^=;\s]+=[^;]*$/.test(item));
+  const pairs: string[] = [];
+  const visit = (item: unknown): void => {
+    if (Array.isArray(item)) {
+      for (const sub of item) visit(sub);
+      return;
+    }
+    if (typeof item !== "string") return;
+    // 先按逗号粗切（Expires 日期会被误切：`Fri` 碎片无等号被丢弃，
+    // `09-Oct-...` 段按 expires 属性名丢弃）。
+    for (const segment of item.split(",")) {
+      const pair = segment.split(";", 1)[0].trim();
+      if (!/^[^=;\s]+=[^;]*$/.test(pair)) continue;
+      if (isCookieAttributePair(pair)) continue;
+      pairs.push(pair);
+    }
+  };
+  for (const item of values) visit(item);
+  return pairs;
 }
 
 function mergeCookieHeaders(...values: unknown[]): string {
   const merged = new Map<string, string>();
-  for (const pair of values.flatMap(cookiePairs)) {
+  for (const pair of cookiePairs(values)) {
     const separator = pair.indexOf("=");
     if (separator <= 0) continue;
     merged.set(pair.slice(0, separator), pair);
@@ -208,20 +238,32 @@ function readSetCookieHeaders(headers: unknown): string {
     [key: string]: unknown;
   };
 
-  const values: unknown[] = [];
+  // AxiosHeaders 的方法依赖 this，必须绑定后调用，不能裸调用。
+  // 多个来源（getSetCookie/get/toJSON/下标）指向同一组值，去重后只取一份。
+  const seen = new Set<string>();
+  const sources: unknown[] = [];
+  const addSource = (value: unknown): void => {
+    if (value === undefined || value === null) return;
+    const key = JSON.stringify(value) ?? String(value);
+    if (seen.has(key)) return;
+    seen.add(key);
+    sources.push(value);
+  };
   if (typeof candidate.getSetCookie === "function") {
-    values.push(candidate.getSetCookie());
+    addSource(candidate.getSetCookie.call(candidate));
   }
   if (typeof candidate.get === "function") {
-    values.push(candidate.get("set-cookie"));
+    addSource(candidate.get.call(candidate, "set-cookie"));
   }
   if (typeof candidate.toJSON === "function") {
-    const json = candidate.toJSON();
-    values.push(json["set-cookie"], json["Set-Cookie"]);
+    const json = candidate.toJSON.call(candidate);
+    addSource(json["set-cookie"]);
+    addSource(json["Set-Cookie"]);
   }
-  values.push(candidate["set-cookie"], candidate["Set-Cookie"]);
+  addSource(candidate["set-cookie"]);
+  addSource(candidate["Set-Cookie"]);
 
-  return mergeCookieHeaders(...values);
+  return mergeCookieHeaders(...sources);
 }
 
 export async function saveAuthCredentials(
@@ -257,17 +299,25 @@ export async function loginWithoutCaptcha(payload: {
     throw new Error("账号或密码不能为空");
   }
 
-  const response = await manwaApi.post("/api/account/login", {
+  const response = await apiPost<ManwaLoginData>("/api/account/login", {
     username: account,
     password,
   });
   const data = getResponseData<ManwaLoginData>(response);
   const cookieFromHeaders = readSetCookieHeaders(response.headers);
-  const cookieFromBody = mergeCookieHeaders(
-    data.uid === undefined ? "" : `uid=${data.uid}`,
-    data.ssid ? `PHPSESSID=${data.ssid}` : "",
-  );
-  const cookie = mergeCookieHeaders(cookieFromHeaders, cookieFromBody);
+  const bodyUid = data.uid === undefined ? "" : `uid=${data.uid}`;
+  const bodySess = data.ssid ? `PHPSESSID=${data.ssid}` : "";
+  // headers 已含 uid+ssid（与 body 同值）时不重复拼接；仅 headers 缺失
+  // 的那一半才用 body 补。
+  const headerHasUid = /(?:^|;\s*)uid=/.test(cookieFromHeaders);
+  const headerHasSess = /(?:^|;\s*)PHPSESSID=/.test(cookieFromHeaders);
+  const cookie = [
+    cookieFromHeaders,
+    !headerHasUid && bodyUid ? bodyUid : "",
+    !headerHasSess && bodySess ? bodySess : "",
+  ]
+    .filter((part) => part)
+    .join("; ");
   if (!cookie) {
     throw new Error("登录成功但未获得会话 Cookie");
   }
@@ -283,7 +333,7 @@ export async function loginWithoutCaptcha(payload: {
 
 export async function logout(): Promise<void> {
   try {
-    await manwaApi.post("/api/account/logout");
+    await apiPost("/api/account/logout", {});
   } finally {
     await clearAuthState();
   }
@@ -305,16 +355,24 @@ export async function getBaseUrl(): Promise<string> {
 
 /**
  * 测量单个候选地址的延迟。
- * 使用 HEAD 请求，3 秒超时。
+ * 用真实 API 路径（/api/search/index）做 GET 探测，且必须携带合法
+ * devid/x-token：服务端对无签名请求返回 501（连带 WAF 计数），会污染
+ * 后续同 IP 的正常请求（表现为 403）。5 秒超时，失败返回 null。
  */
 async function measureLatency(url: string): Promise<number | null> {
   const start = Date.now();
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
-    const res = await fetch(url, {
-      method: "HEAD",
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const headers = await generateHeaders();
+    const probe = `${url.replace(/\/+$/, "")}/api/search/index?k=%E6%B5%B7%E8%B4%BC&page=0`;
+    const res = await fetch(probe, {
       signal: controller.signal,
+      headers: {
+        devid: headers.devid,
+        "x-token": headers["x-token"],
+        "user-agent": USER_AGENT,
+      },
     });
     clearTimeout(timeoutId);
     if (res.ok) {
@@ -358,7 +416,10 @@ export async function init(): Promise<void> {
  * 响应拦截器：把 JSON 编码的 base64 密文解密为 JSON 对象。
  */
 export const manwaApi = axios.create({
-  adapter: "fetch",
+  // Node 侧（调试/测试）用 http adapter：fetch 是浏览器语义，会吞掉
+  // Cookie 请求头（forbidden header），导致登录态收藏 401/請先登入；
+  // Breeze 宿主内无 node:http 时 axios 会自动回退到 fetch。
+  adapter: ["http", "fetch"],
   responseType: "text",
   headers: {
     Accept: "application/json, text/plain, */*",
@@ -369,37 +430,115 @@ export const manwaApi = axios.create({
   },
 });
 
+/**
+ * devid 必须与“发出该请求时”的请求头一一对应：响应解密用错 devid
+ * 会导致 AES `wrong final block length`。
+ *
+ * axios 的 `config.headers` 在发送后不可靠（fetch adapter 会消费/转换），
+ * 且默认值对象全局共享、并发下会被后来者覆盖。因此 devid 不再经过
+ * headers 传给响应拦截器，而是直接挂在本次请求的 `config` 对象上：
+ * 同一个 config 对象从请求拦截器一路传到响应拦截器，并发互不干扰。
+ */
 manwaApi.interceptors.request.use(async (config) => {
-  config.baseURL = await getBaseUrl();
-
+  const mutable = config as typeof config & { devidForDecrypt?: string };
   const headers = await generateHeaders();
+  mutable.devidForDecrypt = headers.devid;
   const cookie = await loadConfig("auth.cookie", "");
 
-  config.headers = config.headers || {};
-  config.headers["devid"] = headers.devid;
-  config.headers["x-token"] = headers["x-token"];
-  config.headers["user-agent"] = USER_AGENT;
+  mutable.headers = mutable.headers ?? {};
+  mutable.headers["devid"] = headers.devid;
+  mutable.headers["x-token"] = headers["x-token"];
+  mutable.headers["user-agent"] = USER_AGENT;
   if (cookie) {
-    config.headers["cookie"] = cookie;
+    // axios 的 fetch adapter 会丢弃小写 `cookie`（按 forbidden header 处理），
+    // 必须用标准 `Cookie` 大小写，AxiosHeaders 才能正确归一化并发送。
+    mutable.headers["Cookie"] = cookie;
   }
 
-  // 把 devid 临时存到 headers 里，供响应拦截器解密使用
-  config.headers["x-manwa-devid"] = headers.devid;
-
-  return config;
+  return mutable;
 });
 
 manwaApi.interceptors.response.use(async (response) => {
-  const devid = String(response.config.headers["x-manwa-devid"] ?? Date.now());
+  const devid = String(
+    (response.config as { devidForDecrypt?: unknown }).devidForDecrypt ??
+      Date.now(),
+  );
   const text = typeof response.data === "string" ? response.data : "";
 
-  // 响应体是 JSON 编码的字符串字面量（即一个 base64 字符串）
+  // 响应体是 JSON 编码的字符串字面量（即一个 base64 字符串）；
+  // 验证码等少数接口直接返回二进制（PNG），此时不做解密原样透传。
+  const trimmed = text.trimStart();
+  if (!trimmed.startsWith('"')) {
+    return response;
+  }
   const encryptedBase64 = JSON.parse(text) as string;
   const decrypted = await apiDecrypt(encryptedBase64, devid);
   response.data = JSON.parse(decrypted);
 
   return response;
 });
+
+/**
+ * 带域名故障转移的请求封装：当前缓存域名连续失败时，按候选列表顺序
+ * 逐个重试（每个域名只试一次），首个成功的域名写回缓存。
+ * 网络错误、HTTP 5xx、解密失败都会触发换域名；业务 code !== 1 不触发
+ *（那是账号/参数问题，换域名也一样）。
+ */
+async function requestWithFailover<T>(
+  run: (baseURL: string) => Promise<T>,
+): Promise<T> {
+  const cached = await getBaseUrl();
+  const ordered = [
+    cached,
+    ...CANDIDATE_BASE_URLS.filter((url) => url !== cached),
+  ];
+  let lastError: unknown = null;
+  for (const baseURL of ordered) {
+    try {
+      await cache.set(BASE_URL_CACHE_KEY, baseURL);
+      return await run(baseURL);
+    } catch (error) {
+      lastError = error;
+      if (
+        axios.isAxiosError(error) &&
+        error.response &&
+        error.response.status < 500
+      ) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("Manwa3 API 错误")) throw error;
+      // 否则换下一个域名继续。
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Manwa3 API 错误: ${String(lastError ?? "未知错误")}`);
+}
+
+type ManwaEnvelope<T> = {
+  code?: number;
+  data?: T;
+  msg?: string;
+};
+
+export async function apiGet<T>(
+  url: string,
+  params?: Record<string, unknown>,
+): Promise<AxiosResponse<ManwaEnvelope<T>>> {
+  return requestWithFailover((baseURL) =>
+    manwaApi.get(url, { params, baseURL }),
+  );
+}
+
+export async function apiPost<T>(
+  url: string,
+  body?: Record<string, unknown>,
+): Promise<AxiosResponse<ManwaEnvelope<T>>> {
+  return requestWithFailover((baseURL) =>
+    manwaApi.post(url, body, { baseURL }),
+  );
+}
 
 /**
  * 类型安全的 API 响应提取。

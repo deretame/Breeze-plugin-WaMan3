@@ -7,13 +7,17 @@
  * - 请求头：devid 为毫秒时间戳，x-token 为 md5hex(devid + "," + TOKEN_SALT)
  */
 
+import "./polyfill";
 import { requireCryptoLike } from "breeze-plugin-kit";
+import type { CryptoApi } from "breeze-plugin-kit";
 
 export const API_KEY_SALT = ",noiusdfy73osadjap012njdsfn";
 export const TOKEN_SALT = "jsdaghuiaonfyudsfnkgjdfkdd";
 export const IMAGE_SECRET_KEY = "my2ecret782ecret";
 
-const crypto = requireCryptoLike();
+function getCrypto(): CryptoApi {
+  return requireCryptoLike();
+}
 
 /**
  * 派生 API 解密密钥。
@@ -23,7 +27,7 @@ export async function deriveApiKey(
   timestamp: string | number,
 ): Promise<string> {
   const seed = `${timestamp}${API_KEY_SALT}`;
-  return await crypto.md5(seed);
+  return await getCrypto().md5(seed);
 }
 
 /**
@@ -34,7 +38,7 @@ export async function generateHeaders(nowMs = Date.now()): Promise<{
   "x-token": string;
 }> {
   const devid = String(nowMs);
-  const token = await crypto.md5(`${devid},${TOKEN_SALT}`);
+  const token = await getCrypto().md5(`${devid},${TOKEN_SALT}`);
   return { devid, "x-token": token };
 }
 
@@ -48,7 +52,7 @@ export async function apiDecrypt(
 ): Promise<string> {
   const key = await deriveApiKey(timestamp);
   const encrypted = bytesFromBase64(encryptedBase64);
-  const decrypted = await crypto.aesEcbPkcs7Decrypt(encrypted, key);
+  const decrypted = await getCrypto().aesEcbPkcs7Decrypt(encrypted, key);
   return new TextDecoder().decode(decrypted);
 }
 
@@ -59,7 +63,7 @@ export async function apiDecrypt(
 export async function imageDecrypt(
   encryptedBytes: Uint8Array,
 ): Promise<Uint8Array> {
-  return await crypto.aesCbcPkcs7Decrypt(
+  return await getCrypto().aesCbcPkcs7Decrypt(
     encryptedBytes,
     IMAGE_SECRET_KEY,
     IMAGE_SECRET_KEY,
