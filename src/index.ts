@@ -26,6 +26,8 @@ import type {
   GetFunctionPagePayload,
   InfoContract,
   ListFavoriteFoldersResult,
+  LoginBundleContract,
+  LoginSubmitResult,
   MetadataListItem,
   MoveFavoriteToFolderPayload,
   ReadSnapshotContract,
@@ -40,7 +42,12 @@ import type {
   ToggleLikeResult,
   UserInfoBundleContract,
 } from "breeze-plugin-kit";
-import { flutterTools } from "breeze-plugin-kit";
+import {
+  buildLoginBundle,
+  buildUnauthorizedError,
+  flutterTools,
+  readLoginValues,
+} from "breeze-plugin-kit";
 import {
   AUTH_ACCOUNT_CONFIG_KEY,
   AUTH_PASSWORD_CONFIG_KEY,
@@ -246,18 +253,14 @@ function createSearchActionItem(name: string): ActionItem {
 
 function parseAuthors(input: string | string[] | undefined | null): string[] {
   if (!input) return [];
-  if (Array.isArray(input))
-    return input.map((s) => String(s).trim()).filter(Boolean);
+  if (Array.isArray(input)) return input.map((s) => String(s).trim()).filter(Boolean);
   return String(input)
     .split("###")
     .map((s) => s.trim())
     .filter(Boolean);
 }
 
-function buildCoverImage(
-  comicId: string,
-  url: string,
-): ReturnType<typeof createImage> {
+function buildCoverImage(comicId: string, url: string): ReturnType<typeof createImage> {
   const path = `comic/${comicId}/cover.webp`;
   return createImage({
     id: comicId,
@@ -283,11 +286,7 @@ function buildSearchItem(raw: ManwaSearchItem) {
     cover: buildCoverImage(id, raw.picx || raw.pic),
     metadata: [
       createBasicMetadata("author", "作者", authors),
-      createBasicMetadata(
-        "categories",
-        "分类",
-        [raw.serialize].filter(Boolean),
-      ),
+      createBasicMetadata("categories", "分类", [raw.serialize].filter(Boolean)),
     ],
     raw: raw as unknown as StringMap,
     extern: {},
@@ -337,11 +336,7 @@ function buildChapterSummary(raw: ManwaChapter): ChapterSummary {
   };
 }
 
-function buildChapterPages(
-  comicId: string,
-  chapterId: string,
-  piclist: ManwaPic[],
-): ChapterPage[] {
+function buildChapterPages(comicId: string, chapterId: string, piclist: ManwaPic[]): ChapterPage[] {
   return piclist.map((pic, index) => {
     const url = String(pic.pic ?? "");
     const fileName = `${index + 1}.webp`;
@@ -356,12 +351,6 @@ function buildChapterPages(
   });
 }
 
-// ---------------------------------------------------------------------------
-// constants
-// ---------------------------------------------------------------------------
-
-const PAGE_SIZE = 20;
-
 const CONTENT_MODE_OPTIONS: Array<{ label: string; value: ContentMode }> = [
   { label: "全部", value: "all" },
   { label: "BL", value: "bl" },
@@ -375,13 +364,16 @@ function abortSignalFallback(timeoutMs: number): AbortSignal | undefined {
   const Controller = globalThis.AbortController;
   if (typeof Controller !== "function") return undefined;
   const controller = new Controller();
-  setTimeout(() => {
-    try {
-      controller.abort();
-    } catch {
-      // ignore
-    }
-  }, Math.max(0, Number(timeoutMs) || 0));
+  setTimeout(
+    () => {
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
+    },
+    Math.max(0, Number(timeoutMs) || 0),
+  );
   return controller.signal;
 }
 
@@ -416,9 +408,7 @@ function buildPagedList(
   pageSize: number,
 ): ComicPagedListContract {
   const items = Array.isArray(rawItems)
-    ? rawItems
-        .filter((item): item is ManwaSearchItem => Boolean(item))
-        .map(buildSearchItem)
+    ? rawItems.filter((item): item is ManwaSearchItem => Boolean(item)).map(buildSearchItem)
     : [];
   return {
     source: PLUGIN_ID,
@@ -441,10 +431,7 @@ function buildPagedList(
 
 type LoginToastLevel = "info" | "success" | "error";
 
-async function showLoginToast(
-  message: string,
-  level: LoginToastLevel,
-): Promise<void> {
+async function showLoginToast(message: string, level: LoginToastLevel): Promise<void> {
   try {
     await flutterTools.showToast({
       title: "蛙漫3登录",
@@ -476,6 +463,55 @@ async function loginWithToast(
     throw error;
   }
 }
+type LoginPayload = {
+  account?: string;
+  password?: string;
+  values?: Record<string, unknown>;
+  reason?: string;
+  persistCredentials?: boolean;
+};
+
+function readLoginFormValues(payload: LoginPayload = {}) {
+  const record = payload as Record<string, unknown>;
+  if (record.values !== undefined) {
+    const kitValues = readLoginValues(payload);
+    return {
+      account: kitValues.account ?? "",
+      password: kitValues.password ?? "",
+    };
+  }
+  return {
+    account: String(record.account ?? "").trim(),
+    password: String(record.password ?? ""),
+  };
+}
+
+async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmitResult> {
+  const { account, password } = readLoginFormValues(payload);
+  const result = await loginWithToast(account, password);
+  return {
+    source: PLUGIN_ID,
+    message: "登录成功，已保存登录状态",
+    data: {
+      account,
+      uid: result.uid === undefined ? "" : String(result.uid),
+    },
+  };
+}
+
+async function getLoginBundle(): Promise<LoginBundleContract> {
+  const { account, password } = await loadAuthCredentials();
+  return buildLoginBundle(PLUGIN_ID, {
+    title: "蛙漫3登录",
+    fields: [
+      { key: "account", kind: "text", label: "账号", required: true },
+      { key: "password", kind: "password", label: "密码", required: true },
+    ],
+    submitFnPath: "loginWithPassword",
+    submitText: "登录",
+    values: { account, password },
+  });
+}
 
 async function init(): Promise<void> {
   await initApi();
@@ -499,13 +535,10 @@ async function getInfo(): Promise<InfoContract> {
 // searchComic — 搜索漫画
 // ---------------------------------------------------------------------------
 
-async function searchComic(
-  payload: SearchComicPayload = {},
-): Promise<SearchResultContract> {
+async function searchComic(payload: SearchComicPayload = {}): Promise<SearchResultContract> {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? 1) || 1);
-  const keyword =
-    String(payload.keyword ?? extern.keyword ?? "1").trim() || "1";
+  const keyword = String(payload.keyword ?? extern.keyword ?? "1").trim() || "1";
 
   const response = await apiGet<ManwaSearchData>("/api/search/index", {
     k: keyword,
@@ -540,9 +573,7 @@ async function searchComic(
 // getComicDetail — 漫画详情
 // ---------------------------------------------------------------------------
 
-async function getComicDetail(
-  payload: ComicDetailPayload = {},
-): Promise<ComicDetailContract> {
+async function getComicDetail(payload: ComicDetailPayload = {}): Promise<ComicDetailContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
 
@@ -555,9 +586,7 @@ async function getComicDetail(
   const tags = Array.isArray(raw.tags)
     ? raw.tags.map((t) => String(t.name ?? "")).filter(Boolean)
     : [];
-  const chapters = Array.isArray(raw.chapter_list)
-    ? raw.chapter_list.map(buildChapterSummary)
-    : [];
+  const chapters = Array.isArray(raw.chapter_list) ? raw.chapter_list.map(buildChapterSummary) : [];
 
   const normal: ComicDetailNormal = {
     comicInfo: {
@@ -573,10 +602,7 @@ async function getComicDetail(
         { label: "更新", value: raw.last_time },
       ]
         .filter(
-          (item) =>
-            item.value !== undefined &&
-            item.value !== null &&
-            String(item.value) !== "",
+          (item) => item.value !== undefined && item.value !== null && String(item.value) !== "",
         )
         .map((item) => createActionItem(`${item.label}：${item.value}`)),
       creator: {
@@ -589,18 +615,13 @@ async function getComicDetail(
           path: "",
           extern: {},
         }),
-        onTap: {},
+        onTap: null,
         extern: {},
       },
       description: String(raw.text ?? ""),
       cover: buildCoverImage(comicId, raw.picx),
       metadata: [
-        createMetadataActionList(
-          "author",
-          "作者",
-          authors,
-          createSearchActionItem,
-        ),
+        createMetadataActionList("author", "作者", authors, createSearchActionItem),
         createMetadataActionList("tags", "标签", tags, createSearchActionItem),
       ].filter((m): m is MetadataListItem => m.value.length > 0),
       extern: {},
@@ -615,7 +636,9 @@ async function getComicDetail(
     isFavourite: false,
     isLiked: false,
     allowComments: false,
+    allowCommentsReason: "蛙漫3暂不支持评论",
     allowLike: false,
+    allowLikeReason: "蛙漫3暂不支持点赞",
     allowCollected: true,
     allowDownload: true,
     extern: {},
@@ -641,9 +664,7 @@ async function getComicDetail(
 // getChapter — 章节内容（下载场景）
 // ---------------------------------------------------------------------------
 
-async function getChapter(
-  payload: ChapterPayload = {},
-): Promise<ChapterContentContract> {
+async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
 
@@ -699,9 +720,7 @@ async function getChapter(
 // getReadSnapshot — 阅读快照（在线阅读用）
 // ---------------------------------------------------------------------------
 
-async function getReadSnapshot(
-  payload: ReadSnapshotPayload = {},
-): Promise<ReadSnapshotContract> {
+async function getReadSnapshot(payload: ReadSnapshotPayload = {}): Promise<ReadSnapshotContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
   const chapterId = String(payload.chapterId ?? "").trim();
@@ -781,9 +800,7 @@ async function fetchImageBytes({
 // toggleLike — 点赞
 // ---------------------------------------------------------------------------
 
-async function toggleLike(
-  payload: ToggleLikePayload = {},
-): Promise<ToggleLikeResult> {
+async function toggleLike(payload: ToggleLikePayload = {}): Promise<ToggleLikeResult> {
   void payload;
   return { liked: false };
 }
@@ -840,11 +857,7 @@ async function startFavoriteAction(
   const comicId = String(payload.comicId ?? "").trim();
   const action = payload.action;
   if (!comicId) {
-    return favoriteWorkflowFailure(
-      payload,
-      "comicId 不能为空",
-      "INVALID_COMIC_ID",
-    );
+    return favoriteWorkflowFailure(payload, "comicId 不能为空", "INVALID_COMIC_ID");
   }
   if (!action) {
     return favoriteWorkflowFailure(payload, "缺少收藏动作", "INVALID_ACTION");
@@ -880,11 +893,7 @@ async function continueFavoriteAction(
   void payload.input;
   void payload.extern;
   if (!String(payload.comicId ?? "").trim()) {
-    return favoriteWorkflowFailure(
-      payload,
-      "comicId 不能为空",
-      "INVALID_COMIC_ID",
-    );
+    return favoriteWorkflowFailure(payload, "comicId 不能为空", "INVALID_COMIC_ID");
   }
   if (!payload.action) {
     return favoriteWorkflowFailure(payload, "缺少收藏动作", "INVALID_ACTION");
@@ -896,16 +905,10 @@ async function continueFavoriteAction(
       "INVALID_CONTINUATION_TOKEN",
     );
   }
-  return favoriteWorkflowFailure(
-    payload,
-    "当前收藏操作不需要继续交互",
-    "UNSUPPORTED_CONTINUATION",
-  );
+  return favoriteWorkflowFailure(payload, "当前收藏操作不需要继续交互", "UNSUPPORTED_CONTINUATION");
 }
 
-async function toggleFavorite(
-  payload: ToggleFavoritePayload = {},
-): Promise<ToggleFavoriteResult> {
+async function toggleFavorite(payload: ToggleFavoritePayload = {}): Promise<ToggleFavoriteResult> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
 
@@ -916,22 +919,16 @@ async function toggleFavorite(
 
 async function ensureFavoriteLogin(): Promise<void> {
   if (!(await getAuthState()).loggedIn) {
-    throw new Error("请先在插件设置中登录账号");
+    throw buildUnauthorizedError(PLUGIN_ID, "请先在插件设置中登录账号");
   }
 }
 
-function normalizeFavoriteFolders(
-  data: unknown,
-): Array<{ id: string; name: string }> {
+function normalizeFavoriteFolders(data: unknown): Array<{ id: string; name: string }> {
   const list = Array.isArray(data)
     ? data
-    : data &&
-        typeof data === "object" &&
-        Array.isArray((data as ManwaFavoriteData).list)
+    : data && typeof data === "object" && Array.isArray((data as ManwaFavoriteData).list)
       ? ((data as ManwaFavoriteData).list ?? [])
-      : data &&
-          typeof data === "object" &&
-          Array.isArray((data as { items?: unknown[] }).items)
+      : data && typeof data === "object" && Array.isArray((data as { items?: unknown[] }).items)
         ? (data as { items: unknown[] }).items
         : [];
 
@@ -949,9 +946,7 @@ function normalizeFavoriteFolders(
     .filter((item): item is { id: string; name: string } => item !== null);
 }
 
-async function fetchFavoriteFolders(): Promise<
-  Array<{ id: string; name: string }>
-> {
+async function fetchFavoriteFolders(): Promise<Array<{ id: string; name: string }>> {
   await ensureFavoriteLogin();
   const response = await apiGet<unknown>("/api/users/folder_list");
   return normalizeFavoriteFolders(getResponseData<unknown>(response));
@@ -1007,9 +1002,7 @@ async function getCloudFavoriteFilterBundle(
   payload: CloudFavoritePayload = {},
 ): Promise<FilterBundleContract> {
   const extern = toStringMap(payload.extern);
-  const selectedFolderId = String(
-    payload.folderId ?? extern.folderId ?? "",
-  ).trim();
+  const selectedFolderId = String(payload.folderId ?? extern.folderId ?? "").trim();
   const folders = await fetchFavoriteFolders();
 
   return {
@@ -1151,9 +1144,7 @@ async function getComicListSceneBundle(): Promise<ComicListSceneBundleContract> 
 // getRankingData — 榜单数据
 // ---------------------------------------------------------------------------
 
-async function getRankingData(
-  _payload: SearchComicPayload = {},
-): Promise<ComicPagedListContract> {
+async function getRankingData(_payload: SearchComicPayload = {}): Promise<ComicPagedListContract> {
   const extern = toStringMap(_payload.extern);
   const rankTypeValue = extern.rankType ?? extern.type;
   const rankType =
@@ -1175,16 +1166,11 @@ async function getRankingData(
 // getNewestData — 更新列表
 // ---------------------------------------------------------------------------
 
-async function getNewestData(
-  payload: SearchComicPayload = {},
-): Promise<ComicPagedListContract> {
-  const response = await apiGet<ManwaSearchItem[] | ManwaFeedData>(
-    "/api/newest/index",
-    {
-      page: readApiPage(payload),
-      c_gender: await readGender(payload),
-    },
-  );
+async function getNewestData(payload: SearchComicPayload = {}): Promise<ComicPagedListContract> {
+  const response = await apiGet<ManwaSearchItem[] | ManwaFeedData>("/api/newest/index", {
+    page: readApiPage(payload),
+    c_gender: await readGender(payload),
+  });
   const data = getResponseData<ManwaSearchItem[] | ManwaFeedData>(response);
   const items = Array.isArray(data) ? data : data.list;
   return buildPagedList(payload, "newestFeed", items, 12);
@@ -1194,9 +1180,7 @@ async function getNewestData(
 // getCategoryData — 分类列表
 // ---------------------------------------------------------------------------
 
-async function getCategoryData(
-  payload: SearchComicPayload = {},
-): Promise<ComicPagedListContract> {
+async function getCategoryData(payload: SearchComicPayload = {}): Promise<ComicPagedListContract> {
   const extern = toStringMap(payload.extern);
   const response = await apiGet<ManwaCategoryData>("/api/classes/index", {
     gender: await readGender(payload, -2),
@@ -1346,9 +1330,7 @@ async function getCategorySceneBundle(): Promise<ComicListSceneBundleContract> {
 // getCommentFeed — 评论列表
 // ---------------------------------------------------------------------------
 
-async function getCommentFeed(
-  _payload: CommentFeedPayload = {},
-): Promise<CommentFeedContract> {
+async function getCommentFeed(_payload: CommentFeedPayload = {}): Promise<CommentFeedContract> {
   const comment: CommentItem = {
     id: "c-1",
     author: { name: "", avatar: { url: "", path: "" } },
@@ -1395,9 +1377,7 @@ async function loadCommentReplies(
 // postComment — 发送评论
 // ---------------------------------------------------------------------------
 
-async function postComment(
-  _payload: CommentPostPayload = {},
-): Promise<CommentMutationContract> {
+async function postComment(_payload: CommentPostPayload = {}): Promise<CommentMutationContract> {
   return {
     source: PLUGIN_ID,
     scheme: { version: "1.0.0" as const, type: "commentMutation" as const },
@@ -1484,6 +1464,7 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
     },
     data: {
       canShowUserInfo: true,
+      canLogin: true,
       values: {
         [AUTH_ACCOUNT_CONFIG_KEY]: account,
         [AUTH_PASSWORD_CONFIG_KEY]: password,
@@ -1601,16 +1582,13 @@ async function onContentModeChanged(
 ): Promise<Record<string, unknown>> {
   const values = toStringMap(payload.allValues);
   const value =
-    payload.key === CONTENT_MODE_CONFIG_KEY
-      ? payload.value
-      : values[CONTENT_MODE_CONFIG_KEY];
+    payload.key === CONTENT_MODE_CONFIG_KEY ? payload.value : values[CONTENT_MODE_CONFIG_KEY];
   const mode = await saveContentMode(value);
   return {
     ok: true,
     [CONTENT_MODE_CONFIG_KEY]: mode,
     message: `内容模式已切换为${
-      CONTENT_MODE_OPTIONS.find((option) => option.value === mode)?.label ??
-      mode
+      CONTENT_MODE_OPTIONS.find((option) => option.value === mode)?.label ?? mode
     }`,
   };
 }
@@ -1677,6 +1655,8 @@ export default {
   getSettingsBundle,
   getCapabilitiesBundle,
   getUserInfoBundle,
+  getLoginBundle,
+  loginWithPassword,
 
   // fnPath callbacks
   onAuthChanged,

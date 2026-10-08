@@ -23,9 +23,7 @@ function getCrypto(): CryptoApi {
  * 派生 API 解密密钥。
  * key = md5hex("{devid},noiusdfy73osadjap012njdsfn")  // 32 字节 hex 字符串
  */
-export async function deriveApiKey(
-  timestamp: string | number,
-): Promise<string> {
+export async function deriveApiKey(timestamp: string | number): Promise<string> {
   const seed = `${timestamp}${API_KEY_SALT}`;
   return await getCrypto().md5(seed);
 }
@@ -60,12 +58,6 @@ export async function apiDecrypt(
  * 解密章节图片。
  * AES-128-CBC + PKCS7，key 与 iv 都是 IMAGE_SECRET_KEY 的 UTF-8 前 16 字节。
  */
-export async function imageDecrypt(
-  encryptedBytes: Uint8Array,
-): Promise<Uint8Array> {
-  return await getCrypto().aesCbcPkcs7Decrypt(
-    encryptedBytes,
-    IMAGE_SECRET_KEY,
-    IMAGE_SECRET_KEY,
-  );
+export async function imageDecrypt(encryptedBytes: Uint8Array): Promise<Uint8Array> {
+  return await getCrypto().aesCbcPkcs7Decrypt(encryptedBytes, IMAGE_SECRET_KEY, IMAGE_SECRET_KEY);
 }

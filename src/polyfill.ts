@@ -28,11 +28,7 @@ export interface NodeCryptoDecipher {
 export interface NodeCryptoShim {
   createHash(algo: string): NodeCryptoHasher;
   createHmac(algo: string, key: Uint8Array | string): NodeCryptoHasher;
-  createDecipheriv(
-    algo: string,
-    key: Uint8Array,
-    iv: Uint8Array | null,
-  ): NodeCryptoDecipher;
+  createDecipheriv(algo: string, key: Uint8Array, iv: Uint8Array | null): NodeCryptoDecipher;
   randomBytes(size: number): Uint8Array;
 }
 
@@ -69,12 +65,7 @@ function hasPluginCryptoMethods(value: unknown): boolean {
  */
 function asNodeCryptoShim(value: unknown): NodeCryptoShim | undefined {
   if (value === null || typeof value !== "object") return undefined;
-  for (const key of [
-    "createHash",
-    "createHmac",
-    "createDecipheriv",
-    "randomBytes",
-  ] as const) {
+  for (const key of ["createHash", "createHmac", "createDecipheriv", "randomBytes"] as const) {
     if (!(key in value)) return undefined;
   }
   const shim = value as NodeCryptoShim;
@@ -136,8 +127,7 @@ function toBytes(input: unknown): Uint8Array {
   throw new TypeError("polyfill crypto：不支持的输入类型");
 }
 
-const BASE64_ALPHABET =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 function base64EncodeFallback(input: Uint8Array): string {
   const data = toBytes(input);
@@ -179,9 +169,7 @@ function base64DecodeFallback(text: string): Uint8Array {
   for (let i = 0; i + 4 <= clean.length; i += 4) {
     const group = clean.slice(i, i + 4);
     const padding = group.endsWith("==") ? 2 : group.endsWith("=") ? 1 : 0;
-    const sextets = [...group.slice(0, 4 - padding)].map((ch) =>
-      sextetValue(ch.charCodeAt(0)),
-    );
+    const sextets = Array.from(group.slice(0, 4 - padding), (ch) => sextetValue(ch.charCodeAt(0)));
     if (sextets.some((v) => v < 0)) {
       continue;
     }
@@ -200,9 +188,7 @@ function base64DecodeFallback(text: string): Uint8Array {
 
 function ensureBase64Globals(): void {
   if (!isFunction(readGlobal("bytesFromBase64"))) {
-    Reflect.set(globalThis, "bytesFromBase64", (text: string) =>
-      base64DecodeFallback(text),
-    );
+    Reflect.set(globalThis, "bytesFromBase64", (text: string) => base64DecodeFallback(text));
   }
   if (!isFunction(readGlobal("bytesToBase64"))) {
     Reflect.set(globalThis, "bytesToBase64", (input: Uint8Array) =>
@@ -212,9 +198,7 @@ function ensureBase64Globals(): void {
 }
 
 function ensureAbortSignalTimeout(): void {
-  const signal = readGlobal("AbortSignal") as
-    | { timeout?: unknown }
-    | undefined;
+  const signal = readGlobal("AbortSignal") as { timeout?: unknown } | undefined;
   const controller = readGlobal("AbortController") as
     | (new () => { abort: () => void; signal: AbortSignal })
     | undefined;
@@ -223,13 +207,16 @@ function ensureAbortSignalTimeout(): void {
   try {
     signal.timeout = (ms: number) => {
       const ctrl = new controller();
-      setTimeout(() => {
-        try {
-          ctrl.abort();
-        } catch {
-          // ignore
-        }
-      }, Math.max(0, Number(ms) || 0));
+      setTimeout(
+        () => {
+          try {
+            ctrl.abort();
+          } catch {
+            // ignore
+          }
+        },
+        Math.max(0, Number(ms) || 0),
+      );
       return ctrl.signal;
     };
   } catch {
@@ -237,10 +224,7 @@ function ensureAbortSignalTimeout(): void {
   }
 }
 
-function md5WithNode(
-  nodeCrypto: NodeCryptoShim,
-  input: unknown,
-): Promise<string> {
+function md5WithNode(nodeCrypto: NodeCryptoShim, input: unknown): Promise<string> {
   const hasher = nodeCrypto.createHash("md5");
   if (typeof input === "string") {
     hasher.update(input, "utf8");
@@ -269,15 +253,10 @@ function aesDecryptWithNode(
   ivRaw?: string,
 ): Promise<Uint8Array> {
   const key = new TextEncoder().encode(String(keyRaw));
-  const iv =
-    algorithm === "aes-128-cbc"
-      ? new TextEncoder().encode(String(ivRaw ?? ""))
-      : null;
+  const iv = algorithm === "aes-128-cbc" ? new TextEncoder().encode(String(ivRaw ?? "")) : null;
   const decipher = nodeCrypto.createDecipheriv(algorithm, key, iv);
   decipher.setAutoPadding(true);
-  return Promise.resolve(
-    concatBytes([decipher.update(toBytes(input)), decipher.final()]),
-  );
+  return Promise.resolve(concatBytes([decipher.update(toBytes(input)), decipher.final()]));
 }
 
 /**
@@ -300,20 +279,14 @@ function ensureCryptoMethods(): void {
   // 在严格模式下失败；原地补方法则各方读到的仍是同一个对象。
   const existing = readGlobal("crypto");
   const target: CryptoMethodTable =
-    existing !== null && typeof existing === "object"
-      ? (existing as CryptoMethodTable)
-      : {};
+    existing !== null && typeof existing === "object" ? (existing as CryptoMethodTable) : {};
   target.md5 = (input: unknown) => md5WithNode(nodeCrypto, input);
   target.aesEcbPkcs7Decrypt = (input: unknown, keyRaw: string) =>
     aesDecryptWithNode(nodeCrypto, "aes-256-ecb", input, keyRaw);
-  target.aesCbcPkcs7Decrypt = (
-    input: unknown,
-    keyRaw: string,
-    ivRaw: string,
-  ) => aesDecryptWithNode(nodeCrypto, "aes-128-cbc", input, keyRaw, ivRaw);
+  target.aesCbcPkcs7Decrypt = (input: unknown, keyRaw: string, ivRaw: string) =>
+    aesDecryptWithNode(nodeCrypto, "aes-128-cbc", input, keyRaw, ivRaw);
   target.createHash = (algo: string) => nodeCrypto.createHash(algo);
-  target.createHmac = (algo: string, key: Uint8Array | string) =>
-    nodeCrypto.createHmac(algo, key);
+  target.createHmac = (algo: string, key: Uint8Array | string) => nodeCrypto.createHmac(algo, key);
   target.randomBytes = (size: number) => nodeCrypto.randomBytes(size);
 
   try {

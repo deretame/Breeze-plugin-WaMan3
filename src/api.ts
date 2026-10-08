@@ -72,16 +72,9 @@ function decodeConfigValue(raw: unknown, fallback = ""): string {
       (parsed as Record<string, unknown>).ok === true &&
       "value" in (parsed as Record<string, unknown>)
     ) {
-      return decodeConfigValue(
-        (parsed as Record<string, unknown>).value,
-        fallback,
-      );
+      return decodeConfigValue((parsed as Record<string, unknown>).value, fallback);
     }
-    if (
-      typeof parsed === "string" ||
-      typeof parsed === "number" ||
-      typeof parsed === "boolean"
-    ) {
+    if (typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean") {
       return String(parsed);
     }
   } catch {
@@ -105,7 +98,9 @@ async function saveConfig(key: string, value: string): Promise<void> {
 }
 
 export function normalizeContentMode(value: unknown): ContentMode {
-  const text = String(value ?? "").trim().toLowerCase();
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase();
   switch (text) {
     case "bl":
     case "0":
@@ -129,20 +124,13 @@ export function normalizeContentMode(value: unknown): ContentMode {
   }
 }
 
-export function contentModeToGender(
-  mode: unknown,
-  allGender: -2 | -1,
-): number {
+export function contentModeToGender(mode: unknown, allGender: -2 | -1): number {
   const normalized = normalizeContentMode(mode);
-  return normalized === "all"
-    ? allGender
-    : CONTENT_MODE_GENDERS[normalized];
+  return normalized === "all" ? allGender : CONTENT_MODE_GENDERS[normalized];
 }
 
 export async function loadContentMode(): Promise<ContentMode> {
-  return normalizeContentMode(
-    await loadConfig(CONTENT_MODE_CONFIG_KEY, DEFAULT_CONTENT_MODE),
-  );
+  return normalizeContentMode(await loadConfig(CONTENT_MODE_CONFIG_KEY, DEFAULT_CONTENT_MODE));
 }
 
 export async function saveContentMode(value: unknown): Promise<ContentMode> {
@@ -266,10 +254,7 @@ function readSetCookieHeaders(headers: unknown): string {
   return mergeCookieHeaders(...sources);
 }
 
-export async function saveAuthCredentials(
-  account: string,
-  password: string,
-): Promise<void> {
+export async function saveAuthCredentials(account: string, password: string): Promise<void> {
   await Promise.all([
     saveConfig(AUTH_ACCOUNT_CONFIG_KEY, account),
     saveConfig(AUTH_PASSWORD_CONFIG_KEY, password),
@@ -396,9 +381,7 @@ export async function init(): Promise<void> {
     })),
   );
 
-  const valid = results.filter(
-    (r): r is { url: string; latency: number } => r.latency !== null,
-  );
+  const valid = results.filter((r): r is { url: string; latency: number } => r.latency !== null);
 
   let fastest = DEFAULT_BASE_URL;
   if (valid.length > 0) {
@@ -460,8 +443,7 @@ manwaApi.interceptors.request.use(async (config) => {
 
 manwaApi.interceptors.response.use(async (response) => {
   const devid = String(
-    (response.config as { devidForDecrypt?: unknown }).devidForDecrypt ??
-      Date.now(),
+    (response.config as { devidForDecrypt?: unknown }).devidForDecrypt ?? Date.now(),
   );
   const text = typeof response.data === "string" ? response.data : "";
 
@@ -484,14 +466,9 @@ manwaApi.interceptors.response.use(async (response) => {
  * 网络错误、HTTP 5xx、解密失败都会触发换域名；业务 code !== 1 不触发
  *（那是账号/参数问题，换域名也一样）。
  */
-async function requestWithFailover<T>(
-  run: (baseURL: string) => Promise<T>,
-): Promise<T> {
+async function requestWithFailover<T>(run: (baseURL: string) => Promise<T>): Promise<T> {
   const cached = await getBaseUrl();
-  const ordered = [
-    cached,
-    ...CANDIDATE_BASE_URLS.filter((url) => url !== cached),
-  ];
+  const ordered = [cached, ...CANDIDATE_BASE_URLS.filter((url) => url !== cached)];
   let lastError: unknown = null;
   for (const baseURL of ordered) {
     try {
@@ -499,11 +476,7 @@ async function requestWithFailover<T>(
       return await run(baseURL);
     } catch (error) {
       lastError = error;
-      if (
-        axios.isAxiosError(error) &&
-        error.response &&
-        error.response.status < 500
-      ) {
+      if (axios.isAxiosError(error) && error.response && error.response.status < 500) {
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -526,18 +499,14 @@ export async function apiGet<T>(
   url: string,
   params?: Record<string, unknown>,
 ): Promise<AxiosResponse<ManwaEnvelope<T>>> {
-  return requestWithFailover((baseURL) =>
-    manwaApi.get(url, { params, baseURL }),
-  );
+  return requestWithFailover((baseURL) => manwaApi.get(url, { params, baseURL }));
 }
 
 export async function apiPost<T>(
   url: string,
   body?: Record<string, unknown>,
 ): Promise<AxiosResponse<ManwaEnvelope<T>>> {
-  return requestWithFailover((baseURL) =>
-    manwaApi.post(url, body, { baseURL }),
-  );
+  return requestWithFailover((baseURL) => manwaApi.post(url, body, { baseURL }));
 }
 
 /**
