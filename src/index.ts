@@ -1418,35 +1418,58 @@ async function postCommentReply(
 // getSettingsBundle — 设置方案
 // ---------------------------------------------------------------------------
 
+/**
+ * 旧宿主（< 3.0.34，不懂 getLoginBundle）才显示 settings 账号区；内容区常驻。
+ * 三段比较：缺段按 0 补齐。
+ */
+function compareVersions(a: string, b: string): number {
+  // dart.getAppVersion 返回 JSON 编码串（首尾带引号），先剥掉。
+  const clean = (v: string) => String(v ?? "").trim().replace(/^"+|"+$/g, "");
+  const pa = clean(a).split(".").map((x) => Number(x) || 0);
+  const pb = clean(b).split(".").map((x) => Number(x) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i += 1) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
   const [{ account, password }, contentMode] = await Promise.all([
     loadAuthCredentials(),
     loadContentMode(),
   ]);
+  const version = await flutterTools.getAppVersion();
+  const legacyHost = compareVersions(version, "3.0.34") < 0;
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0" as const,
       type: "settings" as const,
       sections: [
-        {
-          id: "account",
-          title: "账号",
-          fields: [
-            {
-              key: AUTH_ACCOUNT_CONFIG_KEY,
-              kind: "text" as const,
-              label: "账号",
-              fnPath: "onAuthChanged",
-            },
-            {
-              key: AUTH_PASSWORD_CONFIG_KEY,
-              kind: "password" as const,
-              label: "密码",
-              fnPath: "onAuthChanged",
-            },
-          ],
-        },
+        ...(legacyHost
+          ? [
+              {
+                id: "account",
+                title: "账号",
+                fields: [
+                  {
+                    key: AUTH_ACCOUNT_CONFIG_KEY,
+                    kind: "text" as const,
+                    label: "账号",
+                    fnPath: "onAuthChanged",
+                  },
+                  {
+                    key: AUTH_PASSWORD_CONFIG_KEY,
+                    kind: "password" as const,
+                    label: "密码",
+                    fnPath: "onAuthChanged",
+                  },
+                ],
+              },
+            ]
+          : []),
         {
           id: "content",
           title: "内容",
@@ -1466,8 +1489,12 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
       canShowUserInfo: true,
       canLogin: true,
       values: {
-        [AUTH_ACCOUNT_CONFIG_KEY]: account,
-        [AUTH_PASSWORD_CONFIG_KEY]: password,
+        ...(legacyHost
+          ? {
+              [AUTH_ACCOUNT_CONFIG_KEY]: account,
+              [AUTH_PASSWORD_CONFIG_KEY]: password,
+            }
+          : {}),
         [CONTENT_MODE_CONFIG_KEY]: contentMode,
       },
     },
