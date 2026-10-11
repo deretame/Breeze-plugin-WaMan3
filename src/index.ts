@@ -25,9 +25,10 @@ import type {
   FunctionPageContract,
   GetFunctionPagePayload,
   InfoContract,
-  ListFavoriteFoldersResult,
   LoginBundleContract,
+  LoginField,
   LoginSubmitResult,
+  ListFavoriteFoldersResult,
   MetadataListItem,
   MoveFavoriteToFolderPayload,
   ReadSnapshotContract,
@@ -60,8 +61,10 @@ import {
   getAuthState,
   getResponseData,
   init as initApi,
+  fetchLoginCaptcha,
   loadAuthCredentials,
   loadContentMode,
+  loginWithCaptcha,
   loginWithoutCaptcha,
   logout as logoutFromApi,
   saveAuthCredentials,
@@ -452,10 +455,15 @@ function getLoginErrorMessage(error: unknown): string {
 async function loginWithToast(
   account: string,
   password: string,
+  captcha = "",
 ): Promise<{ uid?: string | number; ssid?: string }> {
   await showLoginToast("正在登录，请稍候…", "info");
   try {
-    const result = await loginWithoutCaptcha({ account, password });
+    // 有码走带码登录；无码（旧宿主/未取图）回退无码登录，服务端会提示要验证码。
+    const result =
+      captcha.trim() !== ""
+        ? await loginWithCaptcha({ account, password, captcha })
+        : await loginWithoutCaptcha({ account, password });
     await showLoginToast("登录成功，已保存登录状态", "success");
     return result;
   } catch (error) {
@@ -466,6 +474,7 @@ async function loginWithToast(
 type LoginPayload = {
   account?: string;
   password?: string;
+  captcha?: string;
   values?: Record<string, unknown>;
   reason?: string;
   persistCredentials?: boolean;
@@ -478,17 +487,19 @@ function readLoginFormValues(payload: LoginPayload = {}) {
     return {
       account: kitValues.account ?? "",
       password: kitValues.password ?? "",
+      captcha: kitValues.captcha ?? "",
     };
   }
   return {
     account: String(record.account ?? "").trim(),
     password: String(record.password ?? ""),
+    captcha: String(record.captcha ?? "").trim(),
   };
 }
 
 async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmitResult> {
-  const { account, password } = readLoginFormValues(payload);
-  const result = await loginWithToast(account, password);
+  const { account, password, captcha } = readLoginFormValues(payload);
+  const result = await loginWithToast(account, password, captcha);
   return {
     source: PLUGIN_ID,
     message: "登录成功，已保存登录状态",
@@ -499,13 +510,39 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
   };
 }
 
+/**
+ * 取登录验证码图（宿主 captcha-image 字段调用）。
+ * 返回 PNG 字节的 base64；验证码会话由 api 层保管，提交时自动带回。
+ */
+async function getCaptchaImage(): Promise<{ imageBase64: string; mimeType: string }> {
+  return fetchLoginCaptcha();
+}
+
 async function getLoginBundle(): Promise<LoginBundleContract> {
-  const { account, password } = await loadAuthCredentials();
+  const [{ account, password }, legacyHost] = await Promise.all([
+    loadAuthCredentials(),
+    isLegacyHost(),
+  ]);
   return buildLoginBundle(PLUGIN_ID, {
     title: "蛙漫3登录",
     fields: [
       { key: "account", kind: "text", label: "账号", required: true },
       { key: "password", kind: "password", label: "密码", required: true },
+      // 旧宿主（3.0.33）不认识 captcha-image，渲染会崩；只在新宿主（3.0.34+）下发。
+      // 旧宿主走无码登录（loginWithoutCaptcha），与 settings 账号区行为一致。
+      ...(legacyHost
+        ? []
+        : [
+            // kit registry 版（0.14.0）的 LoginField 还没有 captcha 字段
+            // （本地 kit 源码已加，未发版），宿主运行时认，先断言绕过。
+            {
+              key: "captcha",
+              kind: "captcha-image",
+              label: "验证码",
+              required: true,
+              captcha: { fetchFnPath: "getCaptchaImage" },
+            } as unknown as LoginField,
+          ]),
     ],
     submitFnPath: "loginWithPassword",
     submitText: "登录",
@@ -515,16 +552,10 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
 
 async function init(): Promise<void> {
   await initApi();
-  const { account, password } = await loadAuthCredentials();
-  if (!account || !password.trim()) return;
-
-  // 初始化时自动登录一次。登录失败不应阻断未登录用户浏览公开内容；
-  // 收藏等登录接口会继续返回明确的业务错误。
-  try {
-    await loginWithoutCaptcha({ account, password });
-  } catch {
-    // 登录结果已经通过 Toast 告知用户。
-  }
+  // 不再自动登录：登录强制要求图形验证码，init 时无用户输入调登录必失败，
+  // 还会弹一次失败 Toast 骚扰用户。登录态靠已持久化的 auth.cookie 复用
+  // （服务端 PHPSESSID 有效期 7 天），过期后由各登录接口返回业务错误，
+  // 宿主引导用户去登录页手动登录。
 }
 
 async function getInfo(): Promise<InfoContract> {
@@ -1424,9 +1455,16 @@ async function postCommentReply(
  */
 function compareVersions(a: string, b: string): number {
   // dart.getAppVersion 返回 JSON 编码串（首尾带引号），先剥掉。
-  const clean = (v: string) => String(v ?? "").trim().replace(/^"+|"+$/g, "");
-  const pa = clean(a).split(".").map((x) => Number(x) || 0);
-  const pb = clean(b).split(".").map((x) => Number(x) || 0);
+  const clean = (v: string) =>
+    String(v ?? "")
+      .trim()
+      .replace(/^"+|"+$/g, "");
+  const pa = clean(a)
+    .split(".")
+    .map((x) => Number(x) || 0);
+  const pb = clean(b)
+    .split(".")
+    .map((x) => Number(x) || 0);
   const len = Math.max(pa.length, pb.length);
   for (let i = 0; i < len; i += 1) {
     const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
@@ -1435,13 +1473,17 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+async function isLegacyHost(): Promise<boolean> {
+  const version = await flutterTools.getAppVersion();
+  return compareVersions(version, "3.0.34") < 0;
+}
+
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
-  const [{ account, password }, contentMode] = await Promise.all([
+  const [{ account, password }, contentMode, legacyHost] = await Promise.all([
     loadAuthCredentials(),
     loadContentMode(),
+    isLegacyHost(),
   ]);
-  const version = await flutterTools.getAppVersion();
-  const legacyHost = compareVersions(version, "3.0.34") < 0;
   return {
     source: PLUGIN_ID,
     scheme: {
@@ -1684,6 +1726,7 @@ export default {
   getUserInfoBundle,
   getLoginBundle,
   loginWithPassword,
+  getCaptchaImage,
 
   // fnPath callbacks
   onAuthChanged,

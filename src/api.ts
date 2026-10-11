@@ -316,6 +316,165 @@ export async function loginWithoutCaptcha(payload: {
   return data;
 }
 
+export type LoginCaptchaImage = {
+  imageBase64: string;
+  mimeType: string;
+};
+
+const AUTH_CAPTCHA_COOKIE_CONFIG_KEY = "auth.captcha_cookie";
+
+/**
+ * 验证码会话（取图响应的 Set-Cookie / PHPSESSID）。
+ * 常驻 QJS 运行时下模块级内存跨 `getCaptchaImage`→`loginWithCaptcha`
+ * 两次调用存活；内存丢失时用持久化值兜底。
+ */
+let captchaCookieMemory = "";
+
+async function loadCaptchaCookie(): Promise<string> {
+  if (captchaCookieMemory) return captchaCookieMemory;
+  captchaCookieMemory = await loadConfig(AUTH_CAPTCHA_COOKIE_CONFIG_KEY, "");
+  return captchaCookieMemory;
+}
+
+async function saveCaptchaCookie(cookie: string): Promise<void> {
+  captchaCookieMemory = cookie;
+  await saveConfig(AUTH_CAPTCHA_COOKIE_CONFIG_KEY, cookie);
+}
+
+async function clearCaptchaCookie(): Promise<void> {
+  captchaCookieMemory = "";
+  await saveConfig(AUTH_CAPTCHA_COOKIE_CONFIG_KEY, "");
+}
+
+function bytesToBase64Local(bytes: Uint8Array): string {
+  const globalBytesToBase64 = (globalThis as Record<string, unknown>)["bytesToBase64"];
+  if (typeof globalBytesToBase64 === "function") {
+    return (globalBytesToBase64 as (input: Uint8Array) => string)(bytes);
+  }
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  if (typeof btoa === "function") return btoa(binary);
+  // Node 兜底（宿主 QJS/浏览器走上面两条）。
+  const nodeBuffer = (globalThis as Record<string, unknown>)["Buffer"] as
+    | { from(input: string, encoding: string): { toString(encoding: string): string } }
+    | undefined;
+  if (nodeBuffer) return nodeBuffer.from(binary, "binary").toString("base64");
+  throw new Error("当前运行时不支持 base64 编码");
+}
+
+/**
+ * 取登录验证码图：GET /api/account/captcha 直接返回 PNG。
+ * 不带登录态 cookie；新图的 PHPSESSID 存入验证码会话，供提交时带回。
+ * 响应拦截器对非 JSON 文本原样透传，这里按字节处理。
+ */
+export async function fetchLoginCaptcha(): Promise<LoginCaptchaImage> {
+  const response = await requestWithFailover((baseURL) =>
+    manwaApi.get("/api/account/captcha", {
+      baseURL,
+      responseType: "arraybuffer",
+      skipAuthCookie: true,
+    } as Record<string, unknown>),
+  );
+  const data: unknown = response.data;
+  // 运行环境差异：Node http adapter 给 Buffer（属于 Uint8Array），
+  // 宿主 QJS 的 fetch adapter 给 ArrayBuffer。两种都要接。
+  let bytes: Uint8Array;
+  if (data instanceof Uint8Array) {
+    bytes = data;
+  } else if (data instanceof ArrayBuffer) {
+    bytes = new Uint8Array(data);
+  } else if (ArrayBuffer.isView(data)) {
+    bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else if (typeof data === "string") {
+    // fetch adapter 未遵守 responseType 时可能给 string：按 latin1 还原字节。
+    bytes = Uint8Array.from([...data].map((ch) => ch.charCodeAt(0) & 0xff));
+  } else if (Array.isArray(data)) {
+    bytes = Uint8Array.from(data as number[]);
+  } else {
+    throw new Error(`验证码图片格式无法识别（data 类型：${typeof data}）`);
+  }
+  if (bytes.length === 0) {
+    throw new Error("验证码图片为空，可能是服务端限流或域名故障");
+  }
+  // PNG 魔数校验：服务端异常时可能回 JSON/HTML 而不是图片，
+  // 直接展示会是破图且会话也是错的；转成明确错误并带上原文方便定位。
+  if (bytes.length < 4 || bytes[0] !== 0x89 || bytes[1] !== 0x50) {
+    const preview = [...bytes.subarray(0, 120)]
+      .map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : "?"))
+      .join("");
+    throw new Error(`验证码图片下载失败（${bytes.length} 字节）：${preview}`);
+  }
+  const session = readSetCookieHeaders(response.headers);
+  if (session) {
+    await saveCaptchaCookie(session);
+  } else {
+    // 运行环境吞掉 Set-Cookie 时清掉旧会话，避免用过期码提交。
+    await clearCaptchaCookie();
+  }
+  return { imageBase64: bytesToBase64Local(bytes), mimeType: "image/png" };
+}
+
+/**
+ * 带验证码登录：body `{ username, password, captcha }`，Cookie 带取图时的
+ * PHPSESSID 会话。验证码一次一码：提交后旧码即作废，无论成功失败，
+ * 提交后都清空验证码会话，下次提交前需重新取图。
+ */
+export async function loginWithCaptcha(payload: {
+  account?: string;
+  password?: string;
+  captcha?: string;
+}): Promise<ManwaLoginData> {
+  const account = String(payload.account ?? "").trim();
+  const password = String(payload.password ?? "");
+  const captcha = String(payload.captcha ?? "").trim();
+  if (!account || !password.trim()) {
+    throw new Error("账号或密码不能为空");
+  }
+  if (!captcha) {
+    throw new Error("验证码不能为空");
+  }
+  const session = await loadCaptchaCookie();
+
+  try {
+    const response = await requestWithFailover((baseURL) =>
+      manwaApi.post(
+        "/api/account/login",
+        { username: account, password, captcha },
+        session ? { baseURL, headers: { Cookie: session } } : { baseURL },
+      ),
+    );
+    const data = getResponseData<ManwaLoginData>(response);
+    const cookieFromHeaders = readSetCookieHeaders(response.headers);
+    const bodyUid = data.uid === undefined ? "" : `uid=${data.uid}`;
+    const bodySess = data.ssid ? `PHPSESSID=${data.ssid}` : "";
+    const headerHasUid = /(?:^|;\s*)uid=/.test(cookieFromHeaders);
+    const headerHasSess = /(?:^|;\s*)PHPSESSID=/.test(cookieFromHeaders);
+    const cookie = [
+      cookieFromHeaders,
+      !headerHasUid && bodyUid ? bodyUid : "",
+      !headerHasSess && bodySess ? bodySess : "",
+    ]
+      .filter((part) => part)
+      .join("; ");
+    if (!cookie) {
+      throw new Error("登录成功但未获得会话 Cookie");
+    }
+
+    await Promise.all([
+      saveAuthCredentials(account, password),
+      saveConfig(AUTH_COOKIE_CONFIG_KEY, cookie),
+      saveConfig(AUTH_UID_CONFIG_KEY, data.uid === undefined ? "" : String(data.uid)),
+      saveConfig(AUTH_SSID_CONFIG_KEY, data.ssid ?? ""),
+    ]);
+    return data;
+  } finally {
+    await clearCaptchaCookie();
+  }
+}
+
 export async function logout(): Promise<void> {
   try {
     await apiPost("/api/account/logout", {});
@@ -423,19 +582,27 @@ export const manwaApi = axios.create({
  * 同一个 config 对象从请求拦截器一路传到响应拦截器，并发互不干扰。
  */
 manwaApi.interceptors.request.use(async (config) => {
-  const mutable = config as typeof config & { devidForDecrypt?: string };
+  const mutable = config as typeof config & {
+    devidForDecrypt?: string;
+    skipAuthCookie?: boolean;
+  };
   const headers = await generateHeaders();
   mutable.devidForDecrypt = headers.devid;
-  const cookie = await loadConfig("auth.cookie", "");
 
   mutable.headers = mutable.headers ?? {};
   mutable.headers["devid"] = headers.devid;
   mutable.headers["x-token"] = headers["x-token"];
   mutable.headers["user-agent"] = USER_AGENT;
-  if (cookie) {
-    // axios 的 fetch adapter 会丢弃小写 `cookie`（按 forbidden header 处理），
-    // 必须用标准 `Cookie` 大小写，AxiosHeaders 才能正确归一化并发送。
-    mutable.headers["Cookie"] = cookie;
+  const explicitCookie = mutable.headers["Cookie"] ?? mutable.headers["cookie"] ?? "";
+  // 调用方显式传了 Cookie（如验证码 session）时优先使用，不被登录态覆盖；
+  // 取验证码图等场景用 skipAuthCookie 主动排除登录态，避免旧会话干扰。
+  if (!explicitCookie && !mutable.skipAuthCookie) {
+    const cookie = await loadConfig("auth.cookie", "");
+    if (cookie) {
+      // axios 的 fetch adapter 会丢弃小写 `cookie`（按 forbidden header 处理），
+      // 必须用标准 `Cookie` 大小写，AxiosHeaders 才能正确归一化并发送。
+      mutable.headers["Cookie"] = cookie;
+    }
   }
 
   return mutable;
