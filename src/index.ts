@@ -533,15 +533,13 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
       ...(legacyHost
         ? []
         : [
-            // kit registry 版（0.14.0）的 LoginField 还没有 captcha 字段
-            // （本地 kit 源码已加，未发版），宿主运行时认，先断言绕过。
             {
               key: "captcha",
               kind: "captcha-image",
               label: "验证码",
               required: true,
               captcha: { fetchFnPath: "getCaptchaImage" },
-            } as unknown as LoginField,
+            } satisfies LoginField,
           ]),
     ],
     submitFnPath: "loginWithPassword",
