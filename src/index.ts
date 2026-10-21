@@ -24,8 +24,13 @@ import type {
   FilterBundleContract,
   FunctionPageContract,
   GetFunctionPagePayload,
+  GetPluginCloudFavoritePagesBundlePayload,
+  GetPluginHomePagesBundlePayload,
   InfoContract,
   LoginBundleContract,
+  PluginCloudFavoritePagesBundleContract,
+  PluginHomePagesBundleContract,
+  PluginHomeTab,
   LoginField,
   LoginSubmitResult,
   ListFavoriteFoldersResult,
@@ -548,12 +553,13 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
   });
 }
 
-async function init(): Promise<void> {
+async function init(): Promise<{ source: string; data: Record<string, unknown> }> {
   await initApi();
   // 不再自动登录：登录强制要求图形验证码，init 时无用户输入调登录必失败，
   // 还会弹一次失败 Toast 骚扰用户。登录态靠已持久化的 auth.cookie 复用
   // （服务端 PHPSESSID 有效期 7 天），过期后由各登录接口返回业务错误，
   // 宿主引导用户去登录页手动登录。
+  return { source: PLUGIN_ID, data: { ok: true, started: true } };
 }
 
 async function getInfo(): Promise<InfoContract> {
@@ -1091,6 +1097,96 @@ async function getCloudFavoriteSceneBundle(): Promise<ComicListSceneBundleContra
           extern: { source: "cloudFavorite" },
         },
       },
+    },
+  };
+}
+// ---------------------------------------------------------------------------
+// getPluginHomePagesBundle / getPluginCloudFavoritePagesBundle — 首页双 bundle
+// ---------------------------------------------------------------------------
+
+function buildHomeTabs(): PluginHomeTab[] {
+  return [
+    {
+      id: "newest",
+      title: "更新",
+      scene: {
+        title: "更新",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: { fnPath: "getNewestData", core: {}, extern: { source: "newest" } },
+        },
+      },
+    },
+    {
+      id: "ranking",
+      title: "排行",
+      scene: {
+        title: "排行",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: { fnPath: "getRankingData", core: {}, extern: { source: "ranking" } },
+        },
+        filter: { fnPath: "getRankingFilterBundle", core: {}, extern: { source: "ranking" } },
+      },
+    },
+    {
+      id: "categories",
+      title: "分类",
+      scene: {
+        title: "分类",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList" as const,
+          request: { fnPath: "getCategoryData", core: {}, extern: { source: "categories" } },
+        },
+        filter: { fnPath: "getCategoryFilterBundle", core: {}, extern: { source: "categories" } },
+      },
+    },
+  ];
+}
+
+async function getPluginHomePagesBundle(
+  _payload: GetPluginHomePagesBundlePayload = {},
+): Promise<PluginHomePagesBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: { version: "1.0.0" as const, type: "homePagesBundle" as const },
+    data: { tabs: buildHomeTabs() },
+  };
+}
+
+async function getPluginCloudFavoritePagesBundle(
+  _payload: GetPluginCloudFavoritePagesBundlePayload = {},
+): Promise<PluginCloudFavoritePagesBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: { version: "1.0.0" as const, type: "cloudFavoritePagesBundle" as const },
+    data: {
+      tabs: [
+        {
+          id: "cloudFavorite",
+          title: "云端收藏",
+          scene: {
+            title: "云端收藏",
+            source: PLUGIN_ID,
+            body: {
+              type: "pluginPagedComicList" as const,
+              request: {
+                fnPath: "getCloudFavoriteData",
+                core: {},
+                extern: { source: "cloudFavorite" },
+              },
+            },
+            filter: {
+              fnPath: "getCloudFavoriteFilterBundle",
+              core: {},
+              extern: { source: "cloudFavorite" },
+            },
+          },
+        },
+      ],
     },
   };
 }
@@ -1717,6 +1813,8 @@ export default {
   getCloudFavoriteData,
   getCloudFavoriteFilterBundle,
   getCloudFavoriteSceneBundle,
+  getPluginHomePagesBundle,
+  getPluginCloudFavoritePagesBundle,
 
   // settings
   getSettingsBundle,

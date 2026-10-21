@@ -7,10 +7,12 @@ export function buildPluginInfo(): InfoContract {
     uuid: PLUGIN_ID,
     iconUrl: "https://manwa.wang/template/wap/32/images/top_icon.png",
     describe: "蛙漫插件",
-    version: "0.0.7",
+    version: "0.1.0",
     home: "https://github.com/deretame/Breeze-plugin-WaMan3",
     updateUrl: "https://api.github.com/repos/deretame/Breeze-plugin-WaMan3/releases/latest",
     npmName: "breeze-plugin-waman3",
+    haveHome: true,
+    haveCloudFavorite: true,
     function: [
       {
         id: "newest",
